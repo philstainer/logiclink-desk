@@ -45,6 +45,14 @@ pub struct QueryResult {
     pub notifications: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveredDevice {
+    pub index: usize,
+    pub name: Option<String>,
+    pub address: String,
+    pub rssi: Option<i16>,
+}
+
 pub struct DeskSession {
     target_name: String,
     peripheral: Peripheral,
@@ -93,6 +101,36 @@ pub async fn run_query(options: QueryOptions) -> Result<QueryResult, BleError> {
     let result = session.send_command(&query, &args, response_window).await;
     session.disconnect().await;
     result
+}
+
+pub async fn scan_devices(scan_timeout: Duration) -> Result<Vec<DiscoveredDevice>, BleError> {
+    let manager = Manager::new().await?;
+    let adapters = manager.adapters().await?;
+    let adapter = adapters.into_iter().next().ok_or(BleError::NoAdapters)?;
+
+    adapter.start_scan(ScanFilter::default()).await?;
+    let deadline = Instant::now() + scan_timeout;
+    let mut devices = Vec::<DiscoveredDevice>::new();
+    while Instant::now() < deadline {
+        for peripheral in adapter.peripherals().await? {
+            let Some(properties) = peripheral.properties().await? else {
+                continue;
+            };
+            let address = properties.address.to_string().to_ascii_lowercase();
+            if devices.iter().any(|device| device.address == address) {
+                continue;
+            }
+            devices.push(DiscoveredDevice {
+                index: devices.len() + 1,
+                name: properties.local_name,
+                address,
+                rssi: properties.rssi,
+            });
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    adapter.stop_scan().await.ok();
+    Ok(devices)
 }
 
 impl DeskSession {

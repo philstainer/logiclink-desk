@@ -1,11 +1,12 @@
 use std::time::Duration;
 
-use bluetooth_desk_control_rust::ble::{DeskSession, QueryOptions, run_query};
-use bluetooth_desk_control_rust::commands::{CommandArg, command_payload};
-use bluetooth_desk_control_rust::protocol::{
+use clap::{Parser, Subcommand};
+use logiclink_desk::ble::{DeskSession, DiscoveredDevice, QueryOptions, run_query, scan_devices};
+use logiclink_desk::commands::{CommandArg, command_payload};
+use logiclink_desk::config::{DeskTarget, config_path, load_config, save_desk};
+use logiclink_desk::protocol::{
     decode_packet, decode_slip_stream, encode_packet, resolve_characteristic, slip_encode,
 };
-use clap::{Parser, Subcommand};
 use serde_json::json;
 
 const SET_HEIGHT_TOLERANCE: i64 = 3;
@@ -25,7 +26,7 @@ const SET_HEIGHT_REVERSAL_SETTLE_MS: u64 = 0;
 const SET_HEIGHT_RESPONSE_WINDOW_MS: u64 = 150;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Rust LOGIClink Bluetooth desk control tooling")]
+#[command(version, about = "LOGIClink desk control tooling")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -47,12 +48,23 @@ enum Command {
         #[arg(long)]
         packet: bool,
     },
+    /// Scan for nearby Bluetooth devices and optionally save one as the default desk.
+    Scan {
+        /// Device index, MAC address, or exact advertised name to save after scanning.
+        #[arg(long)]
+        save: Option<String>,
+        /// Only show devices whose name contains this text.
+        #[arg(long, default_value = "LOGIClink")]
+        name_contains: String,
+        #[arg(long, default_value_t = 15_000)]
+        scan_timeout_ms: u64,
+    },
     /// Run a guarded read-only BLE query.
     Query {
-        #[arg(default_value = "LOGIClink C1022")]
-        target_name: String,
-        #[arg(default_value = "c1:02:2a:05:47:b1")]
-        target_address: String,
+        #[arg(long)]
+        target_name: Option<String>,
+        #[arg(long)]
+        target_address: Option<String>,
         #[arg(default_value = "get-height")]
         query: String,
         #[arg(default_value = "app")]
@@ -67,10 +79,10 @@ enum Command {
     },
     /// Read the current desk height.
     Height {
-        #[arg(default_value = "LOGIClink C1022")]
-        target_name: String,
-        #[arg(default_value = "c1:02:2a:05:47:b1")]
-        target_address: String,
+        #[arg(long)]
+        target_name: Option<String>,
+        #[arg(long)]
+        target_address: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 15_000)]
@@ -90,10 +102,10 @@ enum Command {
         /// Stop once the explicit get-height poll reaches or crosses this height.
         #[arg(long)]
         target_height: Option<i64>,
-        #[arg(default_value = "LOGIClink C1022")]
-        target_name: String,
-        #[arg(default_value = "c1:02:2a:05:47:b1")]
-        target_address: String,
+        #[arg(long)]
+        target_name: Option<String>,
+        #[arg(long)]
+        target_address: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 750)]
@@ -111,10 +123,10 @@ enum Command {
         direction: String,
         #[arg(default_value_t = 20)]
         ticks: u16,
-        #[arg(default_value = "LOGIClink C1022")]
-        target_name: String,
-        #[arg(default_value = "c1:02:2a:05:47:b1")]
-        target_address: String,
+        #[arg(long)]
+        target_name: Option<String>,
+        #[arg(long)]
+        target_address: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 5)]
@@ -130,10 +142,10 @@ enum Command {
     SetHeight {
         /// Target height in centimetres, e.g. 62 or 100.
         target_height_cm: f64,
-        #[arg(default_value = "LOGIClink C1022")]
-        target_name: String,
-        #[arg(default_value = "c1:02:2a:05:47:b1")]
-        target_address: String,
+        #[arg(long)]
+        target_name: Option<String>,
+        #[arg(long)]
+        target_address: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -148,10 +160,10 @@ enum Command {
         /// Signed height delta in centimetres, e.g. 5 or -2.5.
         #[arg(allow_hyphen_values = true)]
         delta_cm: f64,
-        #[arg(default_value = "LOGIClink C1022")]
-        target_name: String,
-        #[arg(default_value = "c1:02:2a:05:47:b1")]
-        target_address: String,
+        #[arg(long)]
+        target_name: Option<String>,
+        #[arg(long)]
+        target_address: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -165,10 +177,10 @@ enum Command {
     Raise {
         /// Height delta in centimetres, e.g. 5 or 2.5.
         delta_cm: f64,
-        #[arg(default_value = "LOGIClink C1022")]
-        target_name: String,
-        #[arg(default_value = "c1:02:2a:05:47:b1")]
-        target_address: String,
+        #[arg(long)]
+        target_name: Option<String>,
+        #[arg(long)]
+        target_address: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -182,10 +194,10 @@ enum Command {
     Lower {
         /// Height delta in centimetres, e.g. 5 or 2.5.
         delta_cm: f64,
-        #[arg(default_value = "LOGIClink C1022")]
-        target_name: String,
-        #[arg(default_value = "c1:02:2a:05:47:b1")]
-        target_address: String,
+        #[arg(long)]
+        target_name: Option<String>,
+        #[arg(long)]
+        target_address: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -201,10 +213,10 @@ enum Command {
         direction: String,
         #[arg(default_value_t = 20)]
         ticks: u16,
-        #[arg(default_value = "LOGIClink C1022")]
-        target_name: String,
-        #[arg(default_value = "c1:02:2a:05:47:b1")]
-        target_address: String,
+        #[arg(long)]
+        target_name: Option<String>,
+        #[arg(long)]
+        target_address: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 100)]
@@ -220,10 +232,10 @@ enum Command {
     },
     /// Benchmark connected get-height response latency at one or more requested intervals.
     BenchHeightPoll {
-        #[arg(default_value = "LOGIClink C1022")]
-        target_name: String,
-        #[arg(default_value = "c1:02:2a:05:47:b1")]
-        target_address: String,
+        #[arg(long)]
+        target_name: Option<String>,
+        #[arg(long)]
+        target_address: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         /// Comma-separated requested intervals to test, in milliseconds.
@@ -295,6 +307,47 @@ async fn main() -> anyhow::Result<()> {
                 }))?;
             }
         }
+        Command::Scan {
+            save,
+            name_contains,
+            scan_timeout_ms,
+        } => {
+            let devices = scan_devices(Duration::from_millis(scan_timeout_ms)).await?;
+            let matching_devices = devices
+                .into_iter()
+                .filter(|device| {
+                    name_contains.is_empty()
+                        || device
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.contains(&name_contains))
+                })
+                .collect::<Vec<_>>();
+            let saved = match save {
+                Some(selector) => {
+                    let device = select_device(&matching_devices, &selector)?;
+                    let desk = DeskTarget {
+                        name: device.name.clone().unwrap_or_default(),
+                        address: device.address.clone(),
+                    };
+                    let path = save_desk(desk.clone())?;
+                    Some(json!({
+                        "name": desk.name,
+                        "address": desk.address,
+                        "configPath": path,
+                    }))
+                }
+                None => None,
+            };
+            print_json(json!({
+                "action": "scan",
+                "scanTimeoutMs": scan_timeout_ms,
+                "nameContains": name_contains,
+                "configPath": config_path()?,
+                "saved": saved,
+                "devices": matching_devices,
+            }))?;
+        }
         Command::Query {
             target_name,
             target_address,
@@ -305,6 +358,7 @@ async fn main() -> anyhow::Result<()> {
             connect_timeout_ms,
             response_window_ms,
         } => {
+            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let args = parse_command_args(&query, &args)?;
             let result = run_query(QueryOptions {
@@ -329,6 +383,7 @@ async fn main() -> anyhow::Result<()> {
             connect_timeout_ms,
             response_window_ms,
         } => {
+            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
             let mut session = DeskSession::connect(query_options(
@@ -365,6 +420,7 @@ async fn main() -> anyhow::Result<()> {
             connect_timeout_ms,
             response_window_ms,
         } => {
+            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let motion_name = motion_command_name(&direction)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let mut samples = Vec::new();
@@ -457,6 +513,7 @@ async fn main() -> anyhow::Result<()> {
             connect_timeout_ms,
             response_window_ms,
         } => {
+            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let motion_name = motion_command_name(&direction)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
@@ -530,6 +587,7 @@ async fn main() -> anyhow::Result<()> {
             scan_timeout_ms,
             connect_timeout_ms,
         } => {
+            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             run_height_move(
                 "set-height",
                 HeightTarget::AbsoluteCm(target_height_cm),
@@ -551,6 +609,7 @@ async fn main() -> anyhow::Result<()> {
             scan_timeout_ms,
             connect_timeout_ms,
         } => {
+            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             run_height_move(
                 "adjust-height",
                 HeightTarget::RelativeCm(delta_cm),
@@ -572,6 +631,7 @@ async fn main() -> anyhow::Result<()> {
             scan_timeout_ms,
             connect_timeout_ms,
         } => {
+            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             run_height_move(
                 "raise",
                 HeightTarget::RelativeCm(positive_delta_cm(delta_cm)?),
@@ -593,6 +653,7 @@ async fn main() -> anyhow::Result<()> {
             scan_timeout_ms,
             connect_timeout_ms,
         } => {
+            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             run_height_move(
                 "lower",
                 HeightTarget::RelativeCm(-positive_delta_cm(delta_cm)?),
@@ -617,6 +678,7 @@ async fn main() -> anyhow::Result<()> {
             connect_timeout_ms,
             response_window_ms,
         } => {
+            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let motion_name = motion_command_name(&direction)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
@@ -715,6 +777,7 @@ async fn main() -> anyhow::Result<()> {
             scan_timeout_ms,
             connect_timeout_ms,
         } => {
+            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let intervals = parse_csv_u64(&intervals_ms)?;
             let response_window = Duration::from_millis(response_wait_ms);
@@ -807,6 +870,48 @@ async fn main() -> anyhow::Result<()> {
 enum HeightTarget {
     AbsoluteCm(f64),
     RelativeCm(f64),
+}
+
+fn resolve_target(
+    target_name: Option<String>,
+    target_address: Option<String>,
+) -> anyhow::Result<(String, String)> {
+    let configured = load_config()?.desk;
+    let name = target_name
+        .or_else(|| configured.as_ref().map(|desk| desk.name.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no desk name configured; run `desk scan --save <index-or-address>` first, or pass --target-name and --target-address"
+            )
+        })?;
+    let address = target_address
+        .or_else(|| configured.as_ref().map(|desk| desk.address.clone()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no desk address configured; run `desk scan --save <index-or-address>` first, or pass --target-name and --target-address"
+            )
+        })?;
+    Ok((name, address.to_ascii_lowercase()))
+}
+
+fn select_device<'a>(
+    devices: &'a [DiscoveredDevice],
+    selector: &str,
+) -> anyhow::Result<&'a DiscoveredDevice> {
+    if let Ok(index) = selector.parse::<usize>() {
+        return devices
+            .iter()
+            .find(|device| device.index == index)
+            .ok_or_else(|| anyhow::anyhow!("no scanned device has index {index}"));
+    }
+    let normalized_selector = selector.to_ascii_lowercase();
+    devices
+        .iter()
+        .find(|device| {
+            device.address == normalized_selector
+                || device.name.as_deref().is_some_and(|name| name == selector)
+        })
+        .ok_or_else(|| anyhow::anyhow!("no scanned device matched '{selector}'"))
 }
 
 #[allow(clippy::too_many_arguments)]

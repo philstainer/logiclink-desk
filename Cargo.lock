@@ -85,23 +85,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bluetooth-desk-control-rust"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "btleplug",
- "clap",
- "futures",
- "hex",
- "rand",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "bluez-async"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -537,6 +520,23 @@ name = "log"
 version = "0.4.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
+
+[[package]]
+name = "logiclink-desk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "btleplug",
+ "clap",
+ "futures",
+ "hex",
+ "rand",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "memchr"
