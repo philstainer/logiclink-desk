@@ -64,9 +64,21 @@ enum Command {
         connect_timeout_ms: u64,
         #[arg(long, default_value_t = 2_500)]
         response_window_ms: u64,
-        /// Allow drive-up, drive-down, or drive-to. This physically moves the desk.
-        #[arg(long)]
-        i_understand_this_moves_the_desk: bool,
+    },
+    /// Read the current desk height.
+    Height {
+        #[arg(default_value = "LOGIClink C1022")]
+        target_name: String,
+        #[arg(default_value = "c1:02:2a:05:47:b1")]
+        target_address: String,
+        #[arg(default_value = "app")]
+        characteristic: String,
+        #[arg(long, default_value_t = 15_000)]
+        scan_timeout_ms: u64,
+        #[arg(long, default_value_t = 15_000)]
+        connect_timeout_ms: u64,
+        #[arg(long, default_value_t = 2_500)]
+        response_window_ms: u64,
     },
     /// Send repeated drive-up or drive-down ticks and poll height after each tick.
     Pulse {
@@ -92,9 +104,6 @@ enum Command {
         connect_timeout_ms: u64,
         #[arg(long, default_value_t = 2_500)]
         response_window_ms: u64,
-        /// Allow physical desk movement.
-        #[arg(long)]
-        i_understand_this_moves_the_desk: bool,
     },
     /// Send repeated motion ticks without per-tick height polling, then read final height.
     Burst {
@@ -116,9 +125,6 @@ enum Command {
         connect_timeout_ms: u64,
         #[arg(long, default_value_t = 400)]
         response_window_ms: u64,
-        /// Allow physical desk movement.
-        #[arg(long)]
-        i_understand_this_moves_the_desk: bool,
     },
     /// Move toward a target height in centimetres using tuned live feedback.
     SetHeight {
@@ -136,9 +142,58 @@ enum Command {
         scan_timeout_ms: u64,
         #[arg(long, default_value_t = 15_000)]
         connect_timeout_ms: u64,
-        /// Allow physical desk movement.
-        #[arg(long)]
-        i_understand_this_moves_the_desk: bool,
+    },
+    /// Move by a signed height delta in centimetres.
+    AdjustHeight {
+        /// Signed height delta in centimetres, e.g. 5 or -2.5.
+        #[arg(allow_hyphen_values = true)]
+        delta_cm: f64,
+        #[arg(default_value = "LOGIClink C1022")]
+        target_name: String,
+        #[arg(default_value = "c1:02:2a:05:47:b1")]
+        target_address: String,
+        #[arg(default_value = "app")]
+        characteristic: String,
+        #[arg(long, default_value_t = 60_000)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = 15_000)]
+        scan_timeout_ms: u64,
+        #[arg(long, default_value_t = 15_000)]
+        connect_timeout_ms: u64,
+    },
+    /// Raise the desk by a height delta in centimetres.
+    Raise {
+        /// Height delta in centimetres, e.g. 5 or 2.5.
+        delta_cm: f64,
+        #[arg(default_value = "LOGIClink C1022")]
+        target_name: String,
+        #[arg(default_value = "c1:02:2a:05:47:b1")]
+        target_address: String,
+        #[arg(default_value = "app")]
+        characteristic: String,
+        #[arg(long, default_value_t = 60_000)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = 15_000)]
+        scan_timeout_ms: u64,
+        #[arg(long, default_value_t = 15_000)]
+        connect_timeout_ms: u64,
+    },
+    /// Lower the desk by a height delta in centimetres.
+    Lower {
+        /// Height delta in centimetres, e.g. 5 or 2.5.
+        delta_cm: f64,
+        #[arg(default_value = "LOGIClink C1022")]
+        target_name: String,
+        #[arg(default_value = "c1:02:2a:05:47:b1")]
+        target_address: String,
+        #[arg(default_value = "app")]
+        characteristic: String,
+        #[arg(long, default_value_t = 60_000)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = 15_000)]
+        scan_timeout_ms: u64,
+        #[arg(long, default_value_t = 15_000)]
+        connect_timeout_ms: u64,
     },
     /// Stream jog ticks and print live height notifications with derived speed.
     WatchMotion {
@@ -162,9 +217,6 @@ enum Command {
         connect_timeout_ms: u64,
         #[arg(long, default_value_t = 400)]
         response_window_ms: u64,
-        /// Allow physical desk movement.
-        #[arg(long)]
-        i_understand_this_moves_the_desk: bool,
     },
     /// Benchmark connected get-height response latency at one or more requested intervals.
     BenchHeightPoll {
@@ -252,7 +304,6 @@ async fn main() -> anyhow::Result<()> {
             scan_timeout_ms,
             connect_timeout_ms,
             response_window_ms,
-            i_understand_this_moves_the_desk,
         } => {
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let args = parse_command_args(&query, &args)?;
@@ -265,10 +316,42 @@ async fn main() -> anyhow::Result<()> {
                 scan_timeout: Duration::from_millis(scan_timeout_ms),
                 connect_timeout: Duration::from_millis(connect_timeout_ms),
                 response_window: Duration::from_millis(response_window_ms),
-                allow_motion: i_understand_this_moves_the_desk,
+                allow_motion: false,
             })
             .await?;
             print_json(result)?;
+        }
+        Command::Height {
+            target_name,
+            target_address,
+            characteristic,
+            scan_timeout_ms,
+            connect_timeout_ms,
+            response_window_ms,
+        } => {
+            let characteristic = resolve_characteristic(&characteristic)?.to_string();
+            let response_window = Duration::from_millis(response_window_ms);
+            let mut session = DeskSession::connect(query_options(
+                &target_name,
+                &target_address,
+                "get-height",
+                Vec::new(),
+                &characteristic,
+                scan_timeout_ms,
+                connect_timeout_ms,
+                response_window_ms,
+                false,
+            ))
+            .await?;
+            let height = read_height(&mut session, response_window).await?;
+            session.disconnect().await;
+            print_json(json!({
+                "targetName": target_name,
+                "targetAddress": target_address,
+                "action": "height",
+                "height": height,
+                "heightCm": height_units_to_cm(height),
+            }))?;
         }
         Command::Pulse {
             direction,
@@ -281,13 +364,7 @@ async fn main() -> anyhow::Result<()> {
             scan_timeout_ms,
             connect_timeout_ms,
             response_window_ms,
-            i_understand_this_moves_the_desk,
         } => {
-            if !i_understand_this_moves_the_desk {
-                anyhow::bail!(
-                    "pulse physically moves the desk; pass --i-understand-this-moves-the-desk"
-                );
-            }
             let motion_name = motion_command_name(&direction)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let mut samples = Vec::new();
@@ -379,13 +456,7 @@ async fn main() -> anyhow::Result<()> {
             scan_timeout_ms,
             connect_timeout_ms,
             response_window_ms,
-            i_understand_this_moves_the_desk,
         } => {
-            if !i_understand_this_moves_the_desk {
-                anyhow::bail!(
-                    "burst physically moves the desk; pass --i-understand-this-moves-the-desk"
-                );
-            }
             let motion_name = motion_command_name(&direction)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
@@ -458,231 +529,81 @@ async fn main() -> anyhow::Result<()> {
             timeout_ms,
             scan_timeout_ms,
             connect_timeout_ms,
-            i_understand_this_moves_the_desk,
         } => {
-            if !i_understand_this_moves_the_desk {
-                anyhow::bail!(
-                    "set-height physically moves the desk; pass --i-understand-this-moves-the-desk"
-                );
-            }
-            let target_height = height_units_from_cm(target_height_cm)?;
-            let tolerance = SET_HEIGHT_TOLERANCE;
-            let burst_ticks = SET_HEIGHT_BURST_TICKS;
-            let interval_ms = SET_HEIGHT_INTERVAL_MS;
-            let fine_ticks = SET_HEIGHT_FINE_TICKS;
-            let fine_interval_ms = SET_HEIGHT_FINE_INTERVAL_MS;
-            let fine_band = SET_HEIGHT_FINE_BAND;
-            let coast_margin = SET_HEIGHT_COAST_MARGIN;
-            let up_coast_margin = SET_HEIGHT_UP_COAST_MARGIN;
-            let down_coast_margin = SET_HEIGHT_DOWN_COAST_MARGIN;
-            let feedback_lag_ms = SET_HEIGHT_FEEDBACK_LAG_MS;
-            let settle_ms = SET_HEIGHT_SETTLE_MS;
-            let correction_settle_ms = SET_HEIGHT_CORRECTION_SETTLE_MS;
-            let height_poll_ms = SET_HEIGHT_HEIGHT_POLL_MS;
-            let reversal_settle_ms = SET_HEIGHT_REVERSAL_SETTLE_MS;
-            let response_window_ms = SET_HEIGHT_RESPONSE_WINDOW_MS;
-            let characteristic = resolve_characteristic(&characteristic)?.to_string();
-            let response_window = Duration::from_millis(response_window_ms);
-            let mut session = DeskSession::connect(query_options(
-                &target_name,
-                &target_address,
-                "get-height",
-                Vec::new(),
-                &characteristic,
+            run_height_move(
+                "set-height",
+                HeightTarget::AbsoluteCm(target_height_cm),
+                target_name,
+                target_address,
+                characteristic,
+                timeout_ms,
                 scan_timeout_ms,
                 connect_timeout_ms,
-                response_window_ms,
-                true,
-            ))
+            )
             .await?;
-
-            let started_at = std::time::Instant::now();
-            let mut samples = Vec::new();
-            let mut current = read_height(&mut session, response_window).await?;
-            let starting_height = current;
-            samples.push(json!({
-                "label": "start",
-                "height": current,
-                "heightCm": height_units_to_cm(current),
-                "deltaToTarget": target_height - current,
-            }));
-
-            let mut correction_count = 0_u32;
-            let mut previous_direction: Option<&'static str> = None;
-            while (target_height - current).abs() > tolerance {
-                if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
-                    anyhow::bail!(
-                        "timed out moving to target: current={current} target={target_height}"
-                    );
-                }
-
-                let delta = target_height - current;
-                let direction = if delta > 0 { "drive-up" } else { "drive-down" };
-                let remaining = delta.abs();
-                let fine_mode = remaining <= fine_band || correction_count > 0;
-                let direction_coast_margin = match direction {
-                    "drive-up" => up_coast_margin,
-                    "drive-down" => down_coast_margin,
-                    _ => coast_margin,
-                };
-                let feedback_stop_margin = stop_margin_for_feedback_lag(
-                    speed_units_per_second(direction),
-                    feedback_lag_ms,
-                );
-                let base_stop_margin = if fine_mode {
-                    match direction {
-                        "drive-up" => direction_coast_margin
-                            .max(tolerance)
-                            .max(feedback_stop_margin),
-                        _ => (direction_coast_margin / 3)
-                            .max(tolerance)
-                            .max(feedback_stop_margin / 2),
-                    }
-                } else {
-                    direction_coast_margin
-                        .max(tolerance)
-                        .max(feedback_stop_margin)
-                };
-                let tick_interval = if fine_mode {
-                    fine_interval_ms
-                } else {
-                    interval_ms
-                };
-                let mut tick_count = 0_u32;
-                let mut live_heights = Vec::new();
-                let mut height_polls = 0_u32;
-                let previous_height = current;
-                let speed_units_per_second = speed_units_per_second(direction);
-                let units_per_tick =
-                    speed_units_per_second * Duration::from_millis(tick_interval).as_secs_f64();
-                let planned_ticks = if fine_mode {
-                    ((remaining.saturating_sub(tolerance)) as f64 / units_per_tick)
-                        .ceil()
-                        .max(1.0) as u32
-                } else {
-                    let planned_distance = (remaining - base_stop_margin).max(1) as f64;
-                    ((planned_distance / speed_units_per_second * 1000.0) / tick_interval as f64)
-                        .ceil()
-                        .max(1.0) as u32
-                };
-                let planned_ticks = if fine_mode {
-                    planned_ticks.min(u32::from(fine_ticks.max(1)))
-                } else {
-                    planned_ticks
-                };
-                let stop_when_within = if fine_mode && direction == "drive-down" {
-                    tolerance
-                } else {
-                    base_stop_margin
-                };
-
-                session.drain_notifications(Duration::from_millis(50)).await;
-
-                let reversing = previous_direction.is_some_and(|previous| previous != direction);
-                if reversing {
-                    tokio::time::sleep(Duration::from_millis(reversal_settle_ms)).await;
-                }
-
-                drive_and_poll_height(
-                    &mut session,
-                    direction,
-                    planned_ticks,
-                    Duration::from_millis(tick_interval),
-                    Duration::from_millis(height_poll_ms),
-                    response_window,
-                    target_height,
-                    stop_when_within,
-                    started_at,
-                    &mut current,
-                    &mut live_heights,
-                    &mut tick_count,
-                    &mut height_polls,
-                    Duration::from_millis(timeout_ms),
-                )
-                .await?;
-
-                previous_direction = Some(direction);
-                let settle_after_move = if correction_count > 0 {
-                    correction_settle_ms
-                } else {
-                    settle_ms
-                };
-                current = update_cached_height_during_wait(
-                    &mut session,
-                    Duration::from_millis(settle_after_move),
-                    Duration::from_millis(height_poll_ms),
-                    response_window,
-                    started_at,
-                    current,
-                    &mut live_heights,
-                    &mut height_polls,
-                )
-                .await?;
-                if (target_height - current).signum() != (target_height - previous_height).signum()
-                    && (target_height - current).abs() > tolerance
-                {
-                    correction_count += 1;
-                }
-                samples.push(json!({
-                    "label": format!("step-{}", samples.len()),
-                    "direction": direction,
-                    "ticks": tick_count,
-                    "plannedTicks": planned_ticks,
-                    "stopWhenWithin": stop_when_within,
-                    "heightPolls": height_polls,
-                    "burstTicks": burst_ticks,
-                    "fineTicks": fine_ticks,
-                    "unitsPerTick": units_per_tick,
-                    "intervalMs": tick_interval,
-                    "baseStopMargin": base_stop_margin,
-                    "feedbackStopMargin": feedback_stop_margin,
-                    "feedbackLagMs": feedback_lag_ms,
-                    "fineMode": fine_mode,
-                    "reversing": reversing,
-                    "speedUnitsPerSecond": speed_units_per_second,
-                    "height": current,
-                    "heightCm": height_units_to_cm(current),
-                    "deltaToTarget": target_height - current,
-                    "motionHeights": live_heights,
-                    "correctionCount": correction_count,
-                    "settleMs": settle_after_move,
-                    "heightPollMs": height_poll_ms,
-                    "elapsedMs": started_at.elapsed().as_millis(),
-                }));
-
-                if correction_count >= 4 {
-                    anyhow::bail!(
-                        "stopped after repeated overshoot corrections: current={current} target={target_height}"
-                    );
-                }
-            }
-
-            session.disconnect().await;
-            print_json(json!({
-                "targetName": target_name,
-                "targetAddress": target_address,
-                "action": "set-height",
-                "targetHeight": target_height,
-                "targetHeightCm": target_height_cm,
-                "tolerance": tolerance,
-                "startingHeight": starting_height,
-                "startingHeightCm": height_units_to_cm(starting_height),
-                "finalHeight": current,
-                "finalHeightCm": height_units_to_cm(current),
-                "observedDelta": current - starting_height,
-                "observedDeltaCm": height_units_to_cm(current - starting_height),
-                "withinTolerance": (target_height - current).abs() <= tolerance,
-                "elapsedMs": started_at.elapsed().as_millis(),
-                "coastMargin": coast_margin,
-                "upCoastMargin": up_coast_margin,
-                "downCoastMargin": down_coast_margin,
-                "feedbackLagMs": feedback_lag_ms,
-                "settleMs": settle_ms,
-                "correctionSettleMs": correction_settle_ms,
-                "heightPollMs": height_poll_ms,
-                "reversalSettleMs": reversal_settle_ms,
-                "samples": samples,
-            }))?;
+        }
+        Command::AdjustHeight {
+            delta_cm,
+            target_name,
+            target_address,
+            characteristic,
+            timeout_ms,
+            scan_timeout_ms,
+            connect_timeout_ms,
+        } => {
+            run_height_move(
+                "adjust-height",
+                HeightTarget::RelativeCm(delta_cm),
+                target_name,
+                target_address,
+                characteristic,
+                timeout_ms,
+                scan_timeout_ms,
+                connect_timeout_ms,
+            )
+            .await?;
+        }
+        Command::Raise {
+            delta_cm,
+            target_name,
+            target_address,
+            characteristic,
+            timeout_ms,
+            scan_timeout_ms,
+            connect_timeout_ms,
+        } => {
+            run_height_move(
+                "raise",
+                HeightTarget::RelativeCm(positive_delta_cm(delta_cm)?),
+                target_name,
+                target_address,
+                characteristic,
+                timeout_ms,
+                scan_timeout_ms,
+                connect_timeout_ms,
+            )
+            .await?;
+        }
+        Command::Lower {
+            delta_cm,
+            target_name,
+            target_address,
+            characteristic,
+            timeout_ms,
+            scan_timeout_ms,
+            connect_timeout_ms,
+        } => {
+            run_height_move(
+                "lower",
+                HeightTarget::RelativeCm(-positive_delta_cm(delta_cm)?),
+                target_name,
+                target_address,
+                characteristic,
+                timeout_ms,
+                scan_timeout_ms,
+                connect_timeout_ms,
+            )
+            .await?;
         }
         Command::WatchMotion {
             direction,
@@ -695,13 +616,7 @@ async fn main() -> anyhow::Result<()> {
             scan_timeout_ms,
             connect_timeout_ms,
             response_window_ms,
-            i_understand_this_moves_the_desk,
         } => {
-            if !i_understand_this_moves_the_desk {
-                anyhow::bail!(
-                    "watch-motion physically moves the desk; pass --i-understand-this-moves-the-desk"
-                );
-            }
             let motion_name = motion_command_name(&direction)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
@@ -889,6 +804,252 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+enum HeightTarget {
+    AbsoluteCm(f64),
+    RelativeCm(f64),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_height_move(
+    action: &str,
+    height_target: HeightTarget,
+    target_name: String,
+    target_address: String,
+    characteristic: String,
+    timeout_ms: u64,
+    scan_timeout_ms: u64,
+    connect_timeout_ms: u64,
+) -> anyhow::Result<()> {
+    let tolerance = SET_HEIGHT_TOLERANCE;
+    let burst_ticks = SET_HEIGHT_BURST_TICKS;
+    let interval_ms = SET_HEIGHT_INTERVAL_MS;
+    let fine_ticks = SET_HEIGHT_FINE_TICKS;
+    let fine_interval_ms = SET_HEIGHT_FINE_INTERVAL_MS;
+    let fine_band = SET_HEIGHT_FINE_BAND;
+    let coast_margin = SET_HEIGHT_COAST_MARGIN;
+    let up_coast_margin = SET_HEIGHT_UP_COAST_MARGIN;
+    let down_coast_margin = SET_HEIGHT_DOWN_COAST_MARGIN;
+    let feedback_lag_ms = SET_HEIGHT_FEEDBACK_LAG_MS;
+    let settle_ms = SET_HEIGHT_SETTLE_MS;
+    let correction_settle_ms = SET_HEIGHT_CORRECTION_SETTLE_MS;
+    let height_poll_ms = SET_HEIGHT_HEIGHT_POLL_MS;
+    let reversal_settle_ms = SET_HEIGHT_REVERSAL_SETTLE_MS;
+    let response_window_ms = SET_HEIGHT_RESPONSE_WINDOW_MS;
+    let characteristic = resolve_characteristic(&characteristic)?.to_string();
+    let response_window = Duration::from_millis(response_window_ms);
+    let mut session = DeskSession::connect(query_options(
+        &target_name,
+        &target_address,
+        "get-height",
+        Vec::new(),
+        &characteristic,
+        scan_timeout_ms,
+        connect_timeout_ms,
+        response_window_ms,
+        true,
+    ))
+    .await?;
+
+    let started_at = std::time::Instant::now();
+    let mut samples = Vec::new();
+    let mut current = read_height(&mut session, response_window).await?;
+    let starting_height = current;
+    let (target_height, requested_delta_cm) = match height_target {
+        HeightTarget::AbsoluteCm(target_height_cm) => {
+            (height_units_from_cm(target_height_cm)?, None)
+        }
+        HeightTarget::RelativeCm(delta_cm) => {
+            let delta_height = height_delta_units_from_cm(delta_cm)?;
+            let target_height = current + delta_height;
+            if target_height <= 0 {
+                anyhow::bail!("target height must be positive");
+            }
+            (target_height, Some(delta_cm))
+        }
+    };
+    samples.push(json!({
+        "label": "start",
+        "height": current,
+        "heightCm": height_units_to_cm(current),
+        "deltaToTarget": target_height - current,
+    }));
+
+    let mut correction_count = 0_u32;
+    let mut previous_direction: Option<&'static str> = None;
+    while (target_height - current).abs() > tolerance {
+        if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
+            anyhow::bail!("timed out moving to target: current={current} target={target_height}");
+        }
+
+        let delta = target_height - current;
+        let direction = if delta > 0 { "drive-up" } else { "drive-down" };
+        let remaining = delta.abs();
+        let fine_mode = remaining <= fine_band || correction_count > 0;
+        let direction_coast_margin = match direction {
+            "drive-up" => up_coast_margin,
+            "drive-down" => down_coast_margin,
+            _ => coast_margin,
+        };
+        let feedback_stop_margin =
+            stop_margin_for_feedback_lag(speed_units_per_second(direction), feedback_lag_ms);
+        let base_stop_margin = if fine_mode {
+            match direction {
+                "drive-up" => direction_coast_margin
+                    .max(tolerance)
+                    .max(feedback_stop_margin),
+                _ => (direction_coast_margin / 3)
+                    .max(tolerance)
+                    .max(feedback_stop_margin / 2),
+            }
+        } else {
+            direction_coast_margin
+                .max(tolerance)
+                .max(feedback_stop_margin)
+        };
+        let tick_interval = if fine_mode {
+            fine_interval_ms
+        } else {
+            interval_ms
+        };
+        let mut tick_count = 0_u32;
+        let mut live_heights = Vec::new();
+        let mut height_polls = 0_u32;
+        let previous_height = current;
+        let speed_units_per_second = speed_units_per_second(direction);
+        let units_per_tick =
+            speed_units_per_second * Duration::from_millis(tick_interval).as_secs_f64();
+        let planned_ticks = if fine_mode {
+            ((remaining.saturating_sub(tolerance)) as f64 / units_per_tick)
+                .ceil()
+                .max(1.0) as u32
+        } else {
+            let planned_distance = (remaining - base_stop_margin).max(1) as f64;
+            ((planned_distance / speed_units_per_second * 1000.0) / tick_interval as f64)
+                .ceil()
+                .max(1.0) as u32
+        };
+        let planned_ticks = if fine_mode {
+            planned_ticks.min(u32::from(fine_ticks.max(1)))
+        } else {
+            planned_ticks
+        };
+        let stop_when_within = if fine_mode && direction == "drive-down" {
+            tolerance
+        } else {
+            base_stop_margin
+        };
+
+        session.drain_notifications(Duration::from_millis(50)).await;
+
+        let reversing = previous_direction.is_some_and(|previous| previous != direction);
+        if reversing {
+            tokio::time::sleep(Duration::from_millis(reversal_settle_ms)).await;
+        }
+
+        drive_and_poll_height(
+            &mut session,
+            direction,
+            planned_ticks,
+            Duration::from_millis(tick_interval),
+            Duration::from_millis(height_poll_ms),
+            response_window,
+            target_height,
+            stop_when_within,
+            started_at,
+            &mut current,
+            &mut live_heights,
+            &mut tick_count,
+            &mut height_polls,
+            Duration::from_millis(timeout_ms),
+        )
+        .await?;
+
+        previous_direction = Some(direction);
+        let settle_after_move = if correction_count > 0 {
+            correction_settle_ms
+        } else {
+            settle_ms
+        };
+        current = update_cached_height_during_wait(
+            &mut session,
+            Duration::from_millis(settle_after_move),
+            Duration::from_millis(height_poll_ms),
+            response_window,
+            started_at,
+            current,
+            &mut live_heights,
+            &mut height_polls,
+        )
+        .await?;
+        if (target_height - current).signum() != (target_height - previous_height).signum()
+            && (target_height - current).abs() > tolerance
+        {
+            correction_count += 1;
+        }
+        samples.push(json!({
+            "label": format!("step-{}", samples.len()),
+            "direction": direction,
+            "ticks": tick_count,
+            "plannedTicks": planned_ticks,
+            "stopWhenWithin": stop_when_within,
+            "heightPolls": height_polls,
+            "burstTicks": burst_ticks,
+            "fineTicks": fine_ticks,
+            "unitsPerTick": units_per_tick,
+            "intervalMs": tick_interval,
+            "baseStopMargin": base_stop_margin,
+            "feedbackStopMargin": feedback_stop_margin,
+            "feedbackLagMs": feedback_lag_ms,
+            "fineMode": fine_mode,
+            "reversing": reversing,
+            "speedUnitsPerSecond": speed_units_per_second,
+            "height": current,
+            "heightCm": height_units_to_cm(current),
+            "deltaToTarget": target_height - current,
+            "motionHeights": live_heights,
+            "correctionCount": correction_count,
+            "settleMs": settle_after_move,
+            "heightPollMs": height_poll_ms,
+            "elapsedMs": started_at.elapsed().as_millis(),
+        }));
+
+        if correction_count >= 4 {
+            anyhow::bail!(
+                "stopped after repeated overshoot corrections: current={current} target={target_height}"
+            );
+        }
+    }
+
+    session.disconnect().await;
+    print_json(json!({
+        "targetName": target_name,
+        "targetAddress": target_address,
+        "action": action,
+        "targetHeight": target_height,
+        "targetHeightCm": height_units_to_cm(target_height),
+        "requestedDeltaCm": requested_delta_cm,
+        "tolerance": tolerance,
+        "startingHeight": starting_height,
+        "startingHeightCm": height_units_to_cm(starting_height),
+        "finalHeight": current,
+        "finalHeightCm": height_units_to_cm(current),
+        "observedDelta": current - starting_height,
+        "observedDeltaCm": height_units_to_cm(current - starting_height),
+        "withinTolerance": (target_height - current).abs() <= tolerance,
+        "elapsedMs": started_at.elapsed().as_millis(),
+        "coastMargin": coast_margin,
+        "upCoastMargin": up_coast_margin,
+        "downCoastMargin": down_coast_margin,
+        "feedbackLagMs": feedback_lag_ms,
+        "settleMs": settle_ms,
+        "correctionSettleMs": correction_settle_ms,
+        "heightPollMs": height_poll_ms,
+        "reversalSettleMs": reversal_settle_ms,
+        "samples": samples,
+    }))?;
+    Ok(())
+}
+
 fn motion_command_name(direction: &str) -> anyhow::Result<&'static str> {
     match direction {
         "up" | "drive-up" => Ok("drive-up"),
@@ -912,6 +1073,7 @@ fn target_reached(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_options(
     target_name: &str,
     target_address: &str,
@@ -959,6 +1121,24 @@ fn height_units_from_cm(height_cm: f64) -> anyhow::Result<i64> {
         anyhow::bail!("target height must be a positive centimetre value");
     }
     Ok((height_cm * 10.0).round() as i64)
+}
+
+fn height_delta_units_from_cm(delta_cm: f64) -> anyhow::Result<i64> {
+    if !delta_cm.is_finite() || delta_cm == 0.0 {
+        anyhow::bail!("height delta must be a non-zero centimetre value");
+    }
+    let delta_units = (delta_cm * 10.0).round() as i64;
+    if delta_units == 0 {
+        anyhow::bail!("height delta must round to at least 0.1 centimetres");
+    }
+    Ok(delta_units)
+}
+
+fn positive_delta_cm(delta_cm: f64) -> anyhow::Result<f64> {
+    if !delta_cm.is_finite() || delta_cm <= 0.0 {
+        anyhow::bail!("height delta must be a positive centimetre value");
+    }
+    Ok(delta_cm)
 }
 
 fn height_units_to_cm(height_units: i64) -> f64 {
@@ -1045,6 +1225,7 @@ async fn drive_and_poll_height(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_cached_height_during_wait(
     session: &mut DeskSession,
     duration: Duration,
@@ -1239,8 +1420,7 @@ fn print_json(value: impl serde::Serialize) -> anyhow::Result<()> {
 }
 
 fn parse_command_args(command_name: &str, args: &[String]) -> anyhow::Result<Vec<CommandArg>> {
-    Ok(args
-        .iter()
+    args.iter()
         .enumerate()
         .map(|(index, arg)| {
             let bytes_arg = matches!(command_name, "handset-command" | "ble-gadget-write")
@@ -1254,7 +1434,7 @@ fn parse_command_args(command_name: &str, args: &[String]) -> anyhow::Result<Vec
                 Ok(CommandArg::Text(arg.clone()))
             }
         })
-        .collect::<Result<Vec<_>, _>>()?)
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn parse_number(value: &str) -> Option<u64> {
@@ -1333,6 +1513,23 @@ mod tests {
         assert_eq!(height_units_from_cm(100.0).unwrap(), 1000);
         assert_eq!(height_units_from_cm(72.5).unwrap(), 725);
         assert!(height_units_from_cm(0.0).is_err());
+    }
+
+    #[test]
+    fn height_delta_allows_signed_centimetres() {
+        assert_eq!(height_delta_units_from_cm(5.0).unwrap(), 50);
+        assert_eq!(height_delta_units_from_cm(-2.5).unwrap(), -25);
+        assert!(height_delta_units_from_cm(0.0).is_err());
+        assert!(height_delta_units_from_cm(0.01).is_err());
+    }
+
+    #[test]
+    fn adjust_height_accepts_negative_delta() {
+        let cli = Cli::try_parse_from(["desk", "adjust-height", "-5"]).unwrap();
+        let Command::AdjustHeight { delta_cm, .. } = cli.command else {
+            panic!("expected adjust-height command");
+        };
+        assert_eq!(delta_cm, -5.0);
     }
 
     #[test]

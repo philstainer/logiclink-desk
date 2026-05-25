@@ -316,9 +316,10 @@ impl DeskSession {
 
 fn validate_read_only_query(options: &QueryOptions) -> Result<(), BleError> {
     let motion_commands = ["drive-up", "drive-down", "drive-to"];
-    if !read_only_commands().contains(&options.query.as_str())
-        && !(options.allow_motion && motion_commands.contains(&options.query.as_str()))
-    {
+    let is_read_only = read_only_commands().contains(&options.query.as_str());
+    let is_allowed_motion =
+        options.allow_motion && motion_commands.contains(&options.query.as_str());
+    if !(is_read_only || is_allowed_motion) {
         return Err(BleError::QueryNotReadOnly(options.query.clone()));
     }
     if options.query == "get-interface-stats" {
