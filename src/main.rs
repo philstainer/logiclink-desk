@@ -881,14 +881,14 @@ fn resolve_target(
         .or_else(|| configured.as_ref().map(|desk| desk.name.clone()))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no desk name configured; run `desk scan --save <index-or-address>` first, or pass --target-name and --target-address"
+                "no desk name configured; run `logiclink-desk scan --save <index-or-address>` first, or pass --target-name and --target-address"
             )
         })?;
     let address = target_address
         .or_else(|| configured.as_ref().map(|desk| desk.address.clone()))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no desk address configured; run `desk scan --save <index-or-address>` first, or pass --target-name and --target-address"
+                "no desk address configured; run `logiclink-desk scan --save <index-or-address>` first, or pass --target-name and --target-address"
             )
         })?;
     Ok((name, address.to_ascii_lowercase()))
