@@ -8,6 +8,22 @@ use bluetooth_desk_control_rust::protocol::{
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+const SET_HEIGHT_TOLERANCE: i64 = 3;
+const SET_HEIGHT_BURST_TICKS: u16 = 10;
+const SET_HEIGHT_INTERVAL_MS: u64 = 180;
+const SET_HEIGHT_FINE_TICKS: u16 = 3;
+const SET_HEIGHT_FINE_INTERVAL_MS: u64 = 150;
+const SET_HEIGHT_FINE_BAND: i64 = 40;
+const SET_HEIGHT_COAST_MARGIN: i64 = 18;
+const SET_HEIGHT_UP_COAST_MARGIN: i64 = 30;
+const SET_HEIGHT_DOWN_COAST_MARGIN: i64 = 16;
+const SET_HEIGHT_FEEDBACK_LAG_MS: u64 = 250;
+const SET_HEIGHT_SETTLE_MS: u64 = 150;
+const SET_HEIGHT_CORRECTION_SETTLE_MS: u64 = 150;
+const SET_HEIGHT_HEIGHT_POLL_MS: u64 = 50;
+const SET_HEIGHT_REVERSAL_SETTLE_MS: u64 = 0;
+const SET_HEIGHT_RESPONSE_WINDOW_MS: u64 = 150;
+
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust LOGIClink Bluetooth desk control tooling")]
 struct Cli {
@@ -104,51 +120,22 @@ enum Command {
         #[arg(long)]
         i_understand_this_moves_the_desk: bool,
     },
-    /// Move toward a target height using continuous jog ticks and live motion feedback.
+    /// Move toward a target height in centimetres using tuned live feedback.
     SetHeight {
-        target_height: i64,
+        /// Target height in centimetres, e.g. 62 or 100.
+        target_height_cm: f64,
         #[arg(default_value = "LOGIClink C1022")]
         target_name: String,
         #[arg(default_value = "c1:02:2a:05:47:b1")]
         target_address: String,
         #[arg(default_value = "app")]
         characteristic: String,
-        #[arg(long, default_value_t = 3)]
-        tolerance: i64,
-        #[arg(long, default_value_t = 10)]
-        burst_ticks: u16,
-        #[arg(long, default_value_t = 180)]
-        interval_ms: u64,
-        #[arg(long, default_value_t = 3)]
-        fine_ticks: u16,
-        #[arg(long, default_value_t = 150)]
-        fine_interval_ms: u64,
-        #[arg(long, default_value_t = 40)]
-        fine_band: i64,
-        #[arg(long, default_value_t = 18)]
-        coast_margin: i64,
-        #[arg(long, default_value_t = 30)]
-        up_coast_margin: i64,
-        #[arg(long, default_value_t = 16)]
-        down_coast_margin: i64,
-        #[arg(long, default_value_t = 250)]
-        feedback_lag_ms: u64,
-        #[arg(long, default_value_t = 150)]
-        settle_ms: u64,
-        #[arg(long, default_value_t = 150)]
-        correction_settle_ms: u64,
-        #[arg(long, default_value_t = 50)]
-        height_poll_ms: u64,
-        #[arg(long, default_value_t = 0)]
-        reversal_settle_ms: u64,
         #[arg(long, default_value_t = 60_000)]
         timeout_ms: u64,
         #[arg(long, default_value_t = 15_000)]
         scan_timeout_ms: u64,
         #[arg(long, default_value_t = 15_000)]
         connect_timeout_ms: u64,
-        #[arg(long, default_value_t = 150)]
-        response_window_ms: u64,
         /// Allow physical desk movement.
         #[arg(long)]
         i_understand_this_moves_the_desk: bool,
@@ -464,28 +451,13 @@ async fn main() -> anyhow::Result<()> {
             }))?;
         }
         Command::SetHeight {
-            target_height,
+            target_height_cm,
             target_name,
             target_address,
             characteristic,
-            tolerance,
-            burst_ticks,
-            interval_ms,
-            fine_ticks,
-            fine_interval_ms,
-            fine_band,
-            coast_margin,
-            up_coast_margin,
-            down_coast_margin,
-            feedback_lag_ms,
-            settle_ms,
-            correction_settle_ms,
-            height_poll_ms,
-            reversal_settle_ms,
             timeout_ms,
             scan_timeout_ms,
             connect_timeout_ms,
-            response_window_ms,
             i_understand_this_moves_the_desk,
         } => {
             if !i_understand_this_moves_the_desk {
@@ -493,6 +465,22 @@ async fn main() -> anyhow::Result<()> {
                     "set-height physically moves the desk; pass --i-understand-this-moves-the-desk"
                 );
             }
+            let target_height = height_units_from_cm(target_height_cm)?;
+            let tolerance = SET_HEIGHT_TOLERANCE;
+            let burst_ticks = SET_HEIGHT_BURST_TICKS;
+            let interval_ms = SET_HEIGHT_INTERVAL_MS;
+            let fine_ticks = SET_HEIGHT_FINE_TICKS;
+            let fine_interval_ms = SET_HEIGHT_FINE_INTERVAL_MS;
+            let fine_band = SET_HEIGHT_FINE_BAND;
+            let coast_margin = SET_HEIGHT_COAST_MARGIN;
+            let up_coast_margin = SET_HEIGHT_UP_COAST_MARGIN;
+            let down_coast_margin = SET_HEIGHT_DOWN_COAST_MARGIN;
+            let feedback_lag_ms = SET_HEIGHT_FEEDBACK_LAG_MS;
+            let settle_ms = SET_HEIGHT_SETTLE_MS;
+            let correction_settle_ms = SET_HEIGHT_CORRECTION_SETTLE_MS;
+            let height_poll_ms = SET_HEIGHT_HEIGHT_POLL_MS;
+            let reversal_settle_ms = SET_HEIGHT_REVERSAL_SETTLE_MS;
+            let response_window_ms = SET_HEIGHT_RESPONSE_WINDOW_MS;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
             let mut session = DeskSession::connect(query_options(
@@ -515,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
             samples.push(json!({
                 "label": "start",
                 "height": current,
+                "heightCm": height_units_to_cm(current),
                 "deltaToTarget": target_height - current,
             }));
 
@@ -652,6 +641,7 @@ async fn main() -> anyhow::Result<()> {
                     "reversing": reversing,
                     "speedUnitsPerSecond": speed_units_per_second,
                     "height": current,
+                    "heightCm": height_units_to_cm(current),
                     "deltaToTarget": target_height - current,
                     "motionHeights": live_heights,
                     "correctionCount": correction_count,
@@ -673,10 +663,14 @@ async fn main() -> anyhow::Result<()> {
                 "targetAddress": target_address,
                 "action": "set-height",
                 "targetHeight": target_height,
+                "targetHeightCm": target_height_cm,
                 "tolerance": tolerance,
                 "startingHeight": starting_height,
+                "startingHeightCm": height_units_to_cm(starting_height),
                 "finalHeight": current,
+                "finalHeightCm": height_units_to_cm(current),
                 "observedDelta": current - starting_height,
+                "observedDeltaCm": height_units_to_cm(current - starting_height),
                 "withinTolerance": (target_height - current).abs() <= tolerance,
                 "elapsedMs": started_at.elapsed().as_millis(),
                 "coastMargin": coast_margin,
@@ -958,6 +952,17 @@ fn notification_height(value: &serde_json::Value) -> Option<i64> {
 
 fn notification_counter(value: &serde_json::Value) -> Option<i64> {
     value.get("parsed")?.get("movementCounter")?.as_i64()
+}
+
+fn height_units_from_cm(height_cm: f64) -> anyhow::Result<i64> {
+    if !height_cm.is_finite() || height_cm <= 0.0 {
+        anyhow::bail!("target height must be a positive centimetre value");
+    }
+    Ok((height_cm * 10.0).round() as i64)
+}
+
+fn height_units_to_cm(height_units: i64) -> f64 {
+    height_units as f64 / 10.0
 }
 
 fn speed_units_per_second(direction: &str) -> f64 {
@@ -1320,6 +1325,14 @@ mod tests {
     fn feedback_lag_margin_rounds_up_movement_during_lag() {
         assert_eq!(stop_margin_for_feedback_lag(34.0, 250), 9);
         assert_eq!(stop_margin_for_feedback_lag(34.0, 0), 0);
+    }
+
+    #[test]
+    fn set_height_target_uses_centimetres() {
+        assert_eq!(height_units_from_cm(62.0).unwrap(), 620);
+        assert_eq!(height_units_from_cm(100.0).unwrap(), 1000);
+        assert_eq!(height_units_from_cm(72.5).unwrap(), 725);
+        assert!(height_units_from_cm(0.0).is_err());
     }
 
     #[test]
