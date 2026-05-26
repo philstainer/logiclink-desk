@@ -1,6 +1,5 @@
 pub mod ble;
 pub mod commands;
-pub mod config;
 pub mod protocol;
 pub mod response;
 

@@ -1,9 +1,8 @@
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use logiclink_desk::ble::{DeskSession, DiscoveredDevice, QueryOptions, run_query, scan_devices};
+use logiclink_desk::ble::{DeskSession, QueryOptions, run_query};
 use logiclink_desk::commands::{CommandArg, command_payload};
-use logiclink_desk::config::{DeskTarget, config_path, load_config, save_desk};
 use logiclink_desk::protocol::{
     decode_packet, decode_slip_stream, encode_packet, resolve_characteristic, slip_encode,
 };
@@ -48,23 +47,10 @@ enum Command {
         #[arg(long)]
         packet: bool,
     },
-    /// Scan for nearby Bluetooth devices and optionally save one as the default desk.
-    Scan {
-        /// Device index, MAC address, or exact advertised name to save after scanning.
-        #[arg(long)]
-        save: Option<String>,
-        /// Only show devices whose name contains this text.
-        #[arg(long, default_value = "LOGIClink")]
-        name_contains: String,
-        #[arg(long, default_value_t = 15_000)]
-        scan_timeout_ms: u64,
-    },
     /// Run a guarded read-only BLE query.
     Query {
         #[arg(long)]
-        target_name: Option<String>,
-        #[arg(long)]
-        target_address: Option<String>,
+        device_name: String,
         #[arg(default_value = "get-height")]
         query: String,
         #[arg(default_value = "app")]
@@ -80,9 +66,7 @@ enum Command {
     /// Read the current desk height.
     Height {
         #[arg(long)]
-        target_name: Option<String>,
-        #[arg(long)]
-        target_address: Option<String>,
+        device_name: String,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 15_000)]
@@ -103,9 +87,7 @@ enum Command {
         #[arg(long)]
         target_height: Option<i64>,
         #[arg(long)]
-        target_name: Option<String>,
-        #[arg(long)]
-        target_address: Option<String>,
+        device_name: String,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 750)]
@@ -124,9 +106,7 @@ enum Command {
         #[arg(default_value_t = 20)]
         ticks: u16,
         #[arg(long)]
-        target_name: Option<String>,
-        #[arg(long)]
-        target_address: Option<String>,
+        device_name: String,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 5)]
@@ -143,9 +123,7 @@ enum Command {
         /// Target height in centimetres, e.g. 62 or 100.
         target_height_cm: f64,
         #[arg(long)]
-        target_name: Option<String>,
-        #[arg(long)]
-        target_address: Option<String>,
+        device_name: String,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -161,9 +139,7 @@ enum Command {
         #[arg(allow_hyphen_values = true)]
         delta_cm: f64,
         #[arg(long)]
-        target_name: Option<String>,
-        #[arg(long)]
-        target_address: Option<String>,
+        device_name: String,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -178,9 +154,7 @@ enum Command {
         /// Height delta in centimetres, e.g. 5 or 2.5.
         delta_cm: f64,
         #[arg(long)]
-        target_name: Option<String>,
-        #[arg(long)]
-        target_address: Option<String>,
+        device_name: String,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -195,9 +169,7 @@ enum Command {
         /// Height delta in centimetres, e.g. 5 or 2.5.
         delta_cm: f64,
         #[arg(long)]
-        target_name: Option<String>,
-        #[arg(long)]
-        target_address: Option<String>,
+        device_name: String,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -214,9 +186,7 @@ enum Command {
         #[arg(default_value_t = 20)]
         ticks: u16,
         #[arg(long)]
-        target_name: Option<String>,
-        #[arg(long)]
-        target_address: Option<String>,
+        device_name: String,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 100)]
@@ -233,9 +203,7 @@ enum Command {
     /// Benchmark connected get-height response latency at one or more requested intervals.
     BenchHeightPoll {
         #[arg(long)]
-        target_name: Option<String>,
-        #[arg(long)]
-        target_address: Option<String>,
+        device_name: String,
         #[arg(default_value = "app")]
         characteristic: String,
         /// Comma-separated requested intervals to test, in milliseconds.
@@ -307,50 +275,8 @@ async fn main() -> anyhow::Result<()> {
                 }))?;
             }
         }
-        Command::Scan {
-            save,
-            name_contains,
-            scan_timeout_ms,
-        } => {
-            let devices = scan_devices(Duration::from_millis(scan_timeout_ms)).await?;
-            let matching_devices = devices
-                .into_iter()
-                .filter(|device| {
-                    name_contains.is_empty()
-                        || device
-                            .name
-                            .as_deref()
-                            .is_some_and(|name| name.contains(&name_contains))
-                })
-                .collect::<Vec<_>>();
-            let saved = match save {
-                Some(selector) => {
-                    let device = select_device(&matching_devices, &selector)?;
-                    let desk = DeskTarget {
-                        name: device.name.clone().unwrap_or_default(),
-                        address: device.address.clone(),
-                    };
-                    let path = save_desk(desk.clone())?;
-                    Some(json!({
-                        "name": desk.name,
-                        "address": desk.address,
-                        "configPath": path,
-                    }))
-                }
-                None => None,
-            };
-            print_json(json!({
-                "action": "scan",
-                "scanTimeoutMs": scan_timeout_ms,
-                "nameContains": name_contains,
-                "configPath": config_path()?,
-                "saved": saved,
-                "devices": matching_devices,
-            }))?;
-        }
         Command::Query {
-            target_name,
-            target_address,
+            device_name,
             query,
             characteristic,
             args,
@@ -358,12 +284,10 @@ async fn main() -> anyhow::Result<()> {
             connect_timeout_ms,
             response_window_ms,
         } => {
-            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let args = parse_command_args(&query, &args)?;
             let result = run_query(QueryOptions {
-                target_name,
-                target_address: target_address.to_ascii_lowercase(),
+                device_name,
                 query,
                 args,
                 characteristic,
@@ -376,19 +300,16 @@ async fn main() -> anyhow::Result<()> {
             print_json(result)?;
         }
         Command::Height {
-            target_name,
-            target_address,
+            device_name,
             characteristic,
             scan_timeout_ms,
             connect_timeout_ms,
             response_window_ms,
         } => {
-            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
             let mut session = DeskSession::connect(query_options(
-                &target_name,
-                &target_address,
+                &device_name,
                 "get-height",
                 Vec::new(),
                 &characteristic,
@@ -401,8 +322,7 @@ async fn main() -> anyhow::Result<()> {
             let height = read_height(&mut session, response_window).await?;
             session.disconnect().await;
             print_json(json!({
-                "targetName": target_name,
-                "targetAddress": target_address,
+                "deviceName": device_name,
                 "action": "height",
                 "height": height,
                 "heightCm": height_units_to_cm(height),
@@ -412,23 +332,20 @@ async fn main() -> anyhow::Result<()> {
             direction,
             ticks,
             target_height,
-            target_name,
-            target_address,
+            device_name,
             characteristic,
             interval_ms,
             scan_timeout_ms,
             connect_timeout_ms,
             response_window_ms,
         } => {
-            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let motion_name = motion_command_name(&direction)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let mut samples = Vec::new();
             let response_window = Duration::from_millis(response_window_ms);
 
             let mut session = DeskSession::connect(query_options(
-                &target_name,
-                &target_address,
+                &device_name,
                 "get-height",
                 Vec::new(),
                 &characteristic,
@@ -484,8 +401,7 @@ async fn main() -> anyhow::Result<()> {
 
             let stopped_reason = stopped_reason.unwrap_or("max-ticks-reached");
             print_json(json!({
-                "targetName": target_name,
-                "targetAddress": target_address,
+                "deviceName": device_name,
                 "action": "pulse",
                 "direction": motion_name,
                 "ticks": ticks,
@@ -505,21 +421,18 @@ async fn main() -> anyhow::Result<()> {
         Command::Burst {
             direction,
             ticks,
-            target_name,
-            target_address,
+            device_name,
             characteristic,
             interval_ms,
             scan_timeout_ms,
             connect_timeout_ms,
             response_window_ms,
         } => {
-            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let motion_name = motion_command_name(&direction)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
             let mut session = DeskSession::connect(query_options(
-                &target_name,
-                &target_address,
+                &device_name,
                 "get-height",
                 Vec::new(),
                 &characteristic,
@@ -558,8 +471,7 @@ async fn main() -> anyhow::Result<()> {
             session.disconnect().await;
 
             print_json(json!({
-                "targetName": target_name,
-                "targetAddress": target_address,
+                "deviceName": device_name,
                 "action": "burst",
                 "direction": motion_name,
                 "ticks": ticks,
@@ -580,19 +492,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::SetHeight {
             target_height_cm,
-            target_name,
-            target_address,
+            device_name,
             characteristic,
             timeout_ms,
             scan_timeout_ms,
             connect_timeout_ms,
         } => {
-            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             run_height_move(
                 "set-height",
                 HeightTarget::AbsoluteCm(target_height_cm),
-                target_name,
-                target_address,
+                device_name,
                 characteristic,
                 timeout_ms,
                 scan_timeout_ms,
@@ -602,19 +511,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::AdjustHeight {
             delta_cm,
-            target_name,
-            target_address,
+            device_name,
             characteristic,
             timeout_ms,
             scan_timeout_ms,
             connect_timeout_ms,
         } => {
-            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             run_height_move(
                 "adjust-height",
                 HeightTarget::RelativeCm(delta_cm),
-                target_name,
-                target_address,
+                device_name,
                 characteristic,
                 timeout_ms,
                 scan_timeout_ms,
@@ -624,19 +530,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Raise {
             delta_cm,
-            target_name,
-            target_address,
+            device_name,
             characteristic,
             timeout_ms,
             scan_timeout_ms,
             connect_timeout_ms,
         } => {
-            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             run_height_move(
                 "raise",
                 HeightTarget::RelativeCm(positive_delta_cm(delta_cm)?),
-                target_name,
-                target_address,
+                device_name,
                 characteristic,
                 timeout_ms,
                 scan_timeout_ms,
@@ -646,19 +549,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Lower {
             delta_cm,
-            target_name,
-            target_address,
+            device_name,
             characteristic,
             timeout_ms,
             scan_timeout_ms,
             connect_timeout_ms,
         } => {
-            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             run_height_move(
                 "lower",
                 HeightTarget::RelativeCm(-positive_delta_cm(delta_cm)?),
-                target_name,
-                target_address,
+                device_name,
                 characteristic,
                 timeout_ms,
                 scan_timeout_ms,
@@ -669,8 +569,7 @@ async fn main() -> anyhow::Result<()> {
         Command::WatchMotion {
             direction,
             ticks,
-            target_name,
-            target_address,
+            device_name,
             characteristic,
             interval_ms,
             drain_ms,
@@ -678,13 +577,11 @@ async fn main() -> anyhow::Result<()> {
             connect_timeout_ms,
             response_window_ms,
         } => {
-            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let motion_name = motion_command_name(&direction)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
             let mut session = DeskSession::connect(query_options(
-                &target_name,
-                &target_address,
+                &device_name,
                 "get-height",
                 Vec::new(),
                 &characteristic,
@@ -748,8 +645,7 @@ async fn main() -> anyhow::Result<()> {
             session.disconnect().await;
 
             print_json(json!({
-                "targetName": target_name,
-                "targetAddress": target_address,
+                "deviceName": device_name,
                 "action": "watch-motion",
                 "direction": motion_name,
                 "ticks": ticks,
@@ -767,8 +663,7 @@ async fn main() -> anyhow::Result<()> {
             }))?;
         }
         Command::BenchHeightPoll {
-            target_name,
-            target_address,
+            device_name,
             characteristic,
             intervals_ms,
             samples,
@@ -777,14 +672,12 @@ async fn main() -> anyhow::Result<()> {
             scan_timeout_ms,
             connect_timeout_ms,
         } => {
-            let (target_name, target_address) = resolve_target(target_name, target_address)?;
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let intervals = parse_csv_u64(&intervals_ms)?;
             let response_window = Duration::from_millis(response_wait_ms);
             let response_quiet = Duration::from_millis(response_quiet_ms);
             let mut session = DeskSession::connect(query_options(
-                &target_name,
-                &target_address,
+                &device_name,
                 "get-height",
                 Vec::new(),
                 &characteristic,
@@ -853,8 +746,7 @@ async fn main() -> anyhow::Result<()> {
             session.disconnect().await;
 
             print_json(json!({
-                "targetName": target_name,
-                "targetAddress": target_address,
+                "deviceName": device_name,
                 "action": "bench-height-poll",
                 "connectedElapsedMs": connected_at.elapsed().as_millis(),
                 "responseWaitMs": response_wait_ms,
@@ -872,54 +764,11 @@ enum HeightTarget {
     RelativeCm(f64),
 }
 
-fn resolve_target(
-    target_name: Option<String>,
-    target_address: Option<String>,
-) -> anyhow::Result<(String, String)> {
-    let configured = load_config()?.desk;
-    let name = target_name
-        .or_else(|| configured.as_ref().map(|desk| desk.name.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no desk name configured; run `logiclink-desk scan --save <index-or-address>` first, or pass --target-name and --target-address"
-            )
-        })?;
-    let address = target_address
-        .or_else(|| configured.as_ref().map(|desk| desk.address.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no desk address configured; run `logiclink-desk scan --save <index-or-address>` first, or pass --target-name and --target-address"
-            )
-        })?;
-    Ok((name, address.to_ascii_lowercase()))
-}
-
-fn select_device<'a>(
-    devices: &'a [DiscoveredDevice],
-    selector: &str,
-) -> anyhow::Result<&'a DiscoveredDevice> {
-    if let Ok(index) = selector.parse::<usize>() {
-        return devices
-            .iter()
-            .find(|device| device.index == index)
-            .ok_or_else(|| anyhow::anyhow!("no scanned device has index {index}"));
-    }
-    let normalized_selector = selector.to_ascii_lowercase();
-    devices
-        .iter()
-        .find(|device| {
-            device.address == normalized_selector
-                || device.name.as_deref().is_some_and(|name| name == selector)
-        })
-        .ok_or_else(|| anyhow::anyhow!("no scanned device matched '{selector}'"))
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_height_move(
     action: &str,
     height_target: HeightTarget,
-    target_name: String,
-    target_address: String,
+    device_name: String,
     characteristic: String,
     timeout_ms: u64,
     scan_timeout_ms: u64,
@@ -943,8 +792,7 @@ async fn run_height_move(
     let characteristic = resolve_characteristic(&characteristic)?.to_string();
     let response_window = Duration::from_millis(response_window_ms);
     let mut session = DeskSession::connect(query_options(
-        &target_name,
-        &target_address,
+        &device_name,
         "get-height",
         Vec::new(),
         &characteristic,
@@ -1127,8 +975,7 @@ async fn run_height_move(
 
     session.disconnect().await;
     print_json(json!({
-        "targetName": target_name,
-        "targetAddress": target_address,
+        "deviceName": device_name,
         "action": action,
         "targetHeight": target_height,
         "targetHeightCm": height_units_to_cm(target_height),
@@ -1180,8 +1027,7 @@ fn target_reached(
 
 #[allow(clippy::too_many_arguments)]
 fn query_options(
-    target_name: &str,
-    target_address: &str,
+    device_name: &str,
     query: &str,
     args: Vec<CommandArg>,
     characteristic: &str,
@@ -1191,8 +1037,7 @@ fn query_options(
     allow_motion: bool,
 ) -> QueryOptions {
     QueryOptions {
-        target_name: target_name.to_string(),
-        target_address: target_address.to_ascii_lowercase(),
+        device_name: device_name.to_string(),
         query: query.to_string(),
         args,
         characteristic: characteristic.to_string(),
@@ -1630,7 +1475,14 @@ mod tests {
 
     #[test]
     fn adjust_height_accepts_negative_delta() {
-        let cli = Cli::try_parse_from(["desk", "adjust-height", "-5"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "desk",
+            "adjust-height",
+            "--device-name",
+            "LOGIClink C1022",
+            "-5",
+        ])
+        .unwrap();
         let Command::AdjustHeight { delta_cm, .. } = cli.command else {
             panic!("expected adjust-height command");
         };

@@ -18,8 +18,7 @@ use crate::protocol::{
 
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
-    pub target_name: String,
-    pub target_address: String,
+    pub device_name: String,
     pub query: String,
     pub args: Vec<CommandArg>,
     pub characteristic: String,
@@ -31,8 +30,8 @@ pub struct QueryOptions {
 
 #[derive(Debug, Serialize)]
 pub struct QueryResult {
-    #[serde(rename = "targetName")]
-    pub target_name: String,
+    #[serde(rename = "deviceName")]
+    pub device_name: String,
     pub query: String,
     pub characteristic: String,
     pub wrote: String,
@@ -45,16 +44,8 @@ pub struct QueryResult {
     pub notifications: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct DiscoveredDevice {
-    pub index: usize,
-    pub name: Option<String>,
-    pub address: String,
-    pub rssi: Option<i16>,
-}
-
 pub struct DeskSession {
-    target_name: String,
+    device_name: String,
     peripheral: Peripheral,
     characteristic: Characteristic,
     characteristic_uuid: Uuid,
@@ -69,10 +60,9 @@ pub enum BleError {
     InterfaceStatsResetRefused,
     #[error("no Bluetooth adapters found")]
     NoAdapters,
-    #[error("did not discover {target_name} / {target_address} within {timeout_ms} ms")]
+    #[error("did not discover {device_name} within {timeout_ms} ms")]
     NotDiscovered {
-        target_name: String,
-        target_address: String,
+        device_name: String,
         timeout_ms: u128,
     },
     #[error("LOGIClink service not found: {0}")]
@@ -101,36 +91,6 @@ pub async fn run_query(options: QueryOptions) -> Result<QueryResult, BleError> {
     let result = session.send_command(&query, &args, response_window).await;
     session.disconnect().await;
     result
-}
-
-pub async fn scan_devices(scan_timeout: Duration) -> Result<Vec<DiscoveredDevice>, BleError> {
-    let manager = Manager::new().await?;
-    let adapters = manager.adapters().await?;
-    let adapter = adapters.into_iter().next().ok_or(BleError::NoAdapters)?;
-
-    adapter.start_scan(ScanFilter::default()).await?;
-    let deadline = Instant::now() + scan_timeout;
-    let mut devices = Vec::<DiscoveredDevice>::new();
-    while Instant::now() < deadline {
-        for peripheral in adapter.peripherals().await? {
-            let Some(properties) = peripheral.properties().await? else {
-                continue;
-            };
-            let address = properties.address.to_string().to_ascii_lowercase();
-            if devices.iter().any(|device| device.address == address) {
-                continue;
-            }
-            devices.push(DiscoveredDevice {
-                index: devices.len() + 1,
-                name: properties.local_name,
-                address,
-                rssi: properties.rssi,
-            });
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    adapter.stop_scan().await.ok();
-    Ok(devices)
 }
 
 impl DeskSession {
@@ -166,7 +126,7 @@ impl DeskSession {
         sleep(Duration::from_millis(500)).await;
 
         Ok(Self {
-            target_name: options.target_name,
+            device_name: options.device_name,
             peripheral,
             characteristic,
             characteristic_uuid,
@@ -210,7 +170,7 @@ impl DeskSession {
             });
 
         Ok(QueryResult {
-            target_name: self.target_name.clone(),
+            device_name: self.device_name.clone(),
             query: query.to_string(),
             characteristic: self.characteristic_uuid.simple().to_string(),
             wrote: hex::encode(frame),
@@ -385,8 +345,7 @@ async fn find_peripheral(
         if Instant::now() >= deadline {
             adapter.stop_scan().await.ok();
             return Err(BleError::NotDiscovered {
-                target_name: options.target_name.clone(),
-                target_address: options.target_address.clone(),
+                device_name: options.device_name.clone(),
                 timeout_ms: options.scan_timeout.as_millis(),
             });
         }
@@ -402,8 +361,7 @@ async fn peripheral_matches(
         return Ok(false);
     };
     let local_name = properties.local_name.unwrap_or_default();
-    let address = properties.address.to_string().to_ascii_lowercase();
-    Ok(local_name == options.target_name || address == options.target_address.to_ascii_lowercase())
+    Ok(local_name == options.device_name)
 }
 
 fn decode_notifications(notifications: Vec<Vec<u8>>) -> Vec<serde_json::Value> {
