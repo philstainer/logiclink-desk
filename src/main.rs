@@ -50,7 +50,7 @@ enum Command {
     /// Run a guarded read-only BLE query.
     Query {
         #[arg(long)]
-        device_name: String,
+        device_name: Option<String>,
         #[arg(default_value = "get-height")]
         query: String,
         #[arg(default_value = "app")]
@@ -66,7 +66,7 @@ enum Command {
     /// Read the current desk height.
     Height {
         #[arg(long)]
-        device_name: String,
+        device_name: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 15_000)]
@@ -87,7 +87,7 @@ enum Command {
         #[arg(long)]
         target_height: Option<i64>,
         #[arg(long)]
-        device_name: String,
+        device_name: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 750)]
@@ -106,7 +106,7 @@ enum Command {
         #[arg(default_value_t = 20)]
         ticks: u16,
         #[arg(long)]
-        device_name: String,
+        device_name: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 5)]
@@ -123,7 +123,7 @@ enum Command {
         /// Target height in centimetres, e.g. 62 or 100.
         target_height_cm: f64,
         #[arg(long)]
-        device_name: String,
+        device_name: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -139,7 +139,7 @@ enum Command {
         #[arg(allow_hyphen_values = true)]
         delta_cm: f64,
         #[arg(long)]
-        device_name: String,
+        device_name: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -154,7 +154,7 @@ enum Command {
         /// Height delta in centimetres, e.g. 5 or 2.5.
         delta_cm: f64,
         #[arg(long)]
-        device_name: String,
+        device_name: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -169,7 +169,7 @@ enum Command {
         /// Height delta in centimetres, e.g. 5 or 2.5.
         delta_cm: f64,
         #[arg(long)]
-        device_name: String,
+        device_name: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 60_000)]
@@ -186,7 +186,7 @@ enum Command {
         #[arg(default_value_t = 20)]
         ticks: u16,
         #[arg(long)]
-        device_name: String,
+        device_name: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         #[arg(long, default_value_t = 100)]
@@ -203,7 +203,7 @@ enum Command {
     /// Benchmark connected get-height response latency at one or more requested intervals.
     BenchHeightPoll {
         #[arg(long)]
-        device_name: String,
+        device_name: Option<String>,
         #[arg(default_value = "app")]
         characteristic: String,
         /// Comma-separated requested intervals to test, in milliseconds.
@@ -309,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
             let mut session = DeskSession::connect(query_options(
-                &device_name,
+                device_name.as_deref(),
                 "get-height",
                 Vec::new(),
                 &characteristic,
@@ -322,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
             let height = read_height(&mut session, response_window).await?;
             session.disconnect().await;
             print_json(json!({
-                "deviceName": device_name,
+                "deviceName": session.device_name(),
                 "action": "height",
                 "height": height,
                 "heightCm": height_units_to_cm(height),
@@ -345,7 +345,7 @@ async fn main() -> anyhow::Result<()> {
             let response_window = Duration::from_millis(response_window_ms);
 
             let mut session = DeskSession::connect(query_options(
-                &device_name,
+                device_name.as_deref(),
                 "get-height",
                 Vec::new(),
                 &characteristic,
@@ -401,7 +401,7 @@ async fn main() -> anyhow::Result<()> {
 
             let stopped_reason = stopped_reason.unwrap_or("max-ticks-reached");
             print_json(json!({
-                "deviceName": device_name,
+                "deviceName": session.device_name(),
                 "action": "pulse",
                 "direction": motion_name,
                 "ticks": ticks,
@@ -432,7 +432,7 @@ async fn main() -> anyhow::Result<()> {
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
             let mut session = DeskSession::connect(query_options(
-                &device_name,
+                device_name.as_deref(),
                 "get-height",
                 Vec::new(),
                 &characteristic,
@@ -471,7 +471,7 @@ async fn main() -> anyhow::Result<()> {
             session.disconnect().await;
 
             print_json(json!({
-                "deviceName": device_name,
+                "deviceName": session.device_name(),
                 "action": "burst",
                 "direction": motion_name,
                 "ticks": ticks,
@@ -581,7 +581,7 @@ async fn main() -> anyhow::Result<()> {
             let characteristic = resolve_characteristic(&characteristic)?.to_string();
             let response_window = Duration::from_millis(response_window_ms);
             let mut session = DeskSession::connect(query_options(
-                &device_name,
+                device_name.as_deref(),
                 "get-height",
                 Vec::new(),
                 &characteristic,
@@ -645,7 +645,7 @@ async fn main() -> anyhow::Result<()> {
             session.disconnect().await;
 
             print_json(json!({
-                "deviceName": device_name,
+                "deviceName": session.device_name(),
                 "action": "watch-motion",
                 "direction": motion_name,
                 "ticks": ticks,
@@ -677,7 +677,7 @@ async fn main() -> anyhow::Result<()> {
             let response_window = Duration::from_millis(response_wait_ms);
             let response_quiet = Duration::from_millis(response_quiet_ms);
             let mut session = DeskSession::connect(query_options(
-                &device_name,
+                device_name.as_deref(),
                 "get-height",
                 Vec::new(),
                 &characteristic,
@@ -746,7 +746,7 @@ async fn main() -> anyhow::Result<()> {
             session.disconnect().await;
 
             print_json(json!({
-                "deviceName": device_name,
+                "deviceName": session.device_name(),
                 "action": "bench-height-poll",
                 "connectedElapsedMs": connected_at.elapsed().as_millis(),
                 "responseWaitMs": response_wait_ms,
@@ -768,7 +768,7 @@ enum HeightTarget {
 async fn run_height_move(
     action: &str,
     height_target: HeightTarget,
-    device_name: String,
+    device_name: Option<String>,
     characteristic: String,
     timeout_ms: u64,
     scan_timeout_ms: u64,
@@ -792,7 +792,7 @@ async fn run_height_move(
     let characteristic = resolve_characteristic(&characteristic)?.to_string();
     let response_window = Duration::from_millis(response_window_ms);
     let mut session = DeskSession::connect(query_options(
-        &device_name,
+        device_name.as_deref(),
         "get-height",
         Vec::new(),
         &characteristic,
@@ -975,7 +975,7 @@ async fn run_height_move(
 
     session.disconnect().await;
     print_json(json!({
-        "deviceName": device_name,
+        "deviceName": session.device_name(),
         "action": action,
         "targetHeight": target_height,
         "targetHeightCm": height_units_to_cm(target_height),
@@ -1027,7 +1027,7 @@ fn target_reached(
 
 #[allow(clippy::too_many_arguments)]
 fn query_options(
-    device_name: &str,
+    device_name: Option<&str>,
     query: &str,
     args: Vec<CommandArg>,
     characteristic: &str,
@@ -1037,7 +1037,7 @@ fn query_options(
     allow_motion: bool,
 ) -> QueryOptions {
     QueryOptions {
-        device_name: device_name.to_string(),
+        device_name: device_name.map(str::to_string),
         query: query.to_string(),
         args,
         characteristic: characteristic.to_string(),

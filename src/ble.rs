@@ -16,9 +16,11 @@ use crate::protocol::{
     GATT_SERVICE, decode_slip_stream, encode_packet, resolve_characteristic, slip_encode,
 };
 
+const DEFAULT_DEVICE_NAME_PREFIX: &str = "LOGIClink";
+
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
-    pub device_name: String,
+    pub device_name: Option<String>,
     pub query: String,
     pub args: Vec<CommandArg>,
     pub characteristic: String,
@@ -65,6 +67,10 @@ pub enum BleError {
         device_name: String,
         timeout_ms: u128,
     },
+    #[error("found multiple matching desks: {0}; pass --device-name to choose one")]
+    MultipleDevices(String),
+    #[error("discovered matching desk without a Bluetooth device name")]
+    MissingDeviceName,
     #[error("LOGIClink service not found: {0}")]
     ServiceNotFound(String),
     #[error("LOGIClink characteristic not found: {0}")]
@@ -100,7 +106,7 @@ impl DeskSession {
         let manager = Manager::new().await?;
         let adapters = manager.adapters().await?;
         let adapter = adapters.into_iter().next().ok_or(BleError::NoAdapters)?;
-        let peripheral = find_peripheral(&adapter, &options).await?;
+        let (peripheral, device_name) = find_peripheral(&adapter, &options).await?;
 
         timeout_named(options.connect_timeout, "connect", peripheral.connect()).await?;
         peripheral.discover_services().await?;
@@ -126,7 +132,7 @@ impl DeskSession {
         sleep(Duration::from_millis(500)).await;
 
         Ok(Self {
-            device_name: options.device_name,
+            device_name,
             peripheral,
             characteristic,
             characteristic_uuid,
@@ -192,6 +198,10 @@ impl DeskSession {
             .write(&self.characteristic, &frame, WriteType::WithoutResponse)
             .await?;
         Ok(hex::encode(frame))
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.device_name
     }
 
     pub async fn drain_notifications(
@@ -332,20 +342,41 @@ fn validate_read_only_query(options: &QueryOptions) -> Result<(), BleError> {
 async fn find_peripheral(
     adapter: &Adapter,
     options: &QueryOptions,
-) -> Result<Peripheral, BleError> {
+) -> Result<(Peripheral, String), BleError> {
     adapter.start_scan(ScanFilter::default()).await?;
     let deadline = Instant::now() + options.scan_timeout;
     loop {
+        let mut matches = Vec::new();
         for peripheral in adapter.peripherals().await? {
-            if peripheral_matches(&peripheral, options).await? {
-                adapter.stop_scan().await.ok();
-                return Ok(peripheral);
+            if let Some(device_name) = matching_device_name(&peripheral, options).await? {
+                matches.push((peripheral, device_name));
             }
+        }
+        if options.device_name.is_some() {
+            if let Some((peripheral, device_name)) = matches.into_iter().next() {
+                adapter.stop_scan().await.ok();
+                return Ok((peripheral, device_name));
+            }
+        } else if matches.len() == 1 {
+            let (peripheral, device_name) = matches.remove(0);
+            adapter.stop_scan().await.ok();
+            return Ok((peripheral, device_name));
+        } else if matches.len() > 1 {
+            adapter.stop_scan().await.ok();
+            let names = matches
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(BleError::MultipleDevices(names));
         }
         if Instant::now() >= deadline {
             adapter.stop_scan().await.ok();
             return Err(BleError::NotDiscovered {
-                device_name: options.device_name.clone(),
+                device_name: options
+                    .device_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{DEFAULT_DEVICE_NAME_PREFIX} device")),
                 timeout_ms: options.scan_timeout.as_millis(),
             });
         }
@@ -353,15 +384,26 @@ async fn find_peripheral(
     }
 }
 
-async fn peripheral_matches(
+async fn matching_device_name(
     peripheral: &Peripheral,
     options: &QueryOptions,
-) -> Result<bool, BleError> {
+) -> Result<Option<String>, BleError> {
     let Some(properties) = peripheral.properties().await? else {
-        return Ok(false);
+        return Ok(None);
     };
     let local_name = properties.local_name.unwrap_or_default();
-    Ok(local_name == options.device_name)
+    if options
+        .device_name
+        .as_deref()
+        .is_some_and(|device_name| local_name == device_name)
+        || options.device_name.is_none() && local_name.contains(DEFAULT_DEVICE_NAME_PREFIX)
+    {
+        if local_name.is_empty() {
+            return Err(BleError::MissingDeviceName);
+        }
+        return Ok(Some(local_name));
+    }
+    Ok(None)
 }
 
 fn decode_notifications(notifications: Vec<Vec<u8>>) -> Vec<serde_json::Value> {
