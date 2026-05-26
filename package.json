@@ -1,0 +1,30 @@
+{
+  "name": "logiclink-desk",
+  "version": "0.1.0",
+  "description": "CLI tooling for LOGIClink Bluetooth standing desks.",
+  "bin": {
+    "logiclink-desk": "npm/bin/logiclink-desk.js"
+  },
+  "files": [
+    "npm/",
+    "prebuilt/",
+    "README.md"
+  ],
+  "scripts": {
+    "build:release": "cargo build --release",
+    "package:binary": "node npm/scripts/package-binary.js",
+    "prepare:binary": "npm run build:release && npm run package:binary",
+    "prepack": "node npm/scripts/verify-package.js"
+  },
+  "keywords": [
+    "bluetooth",
+    "desk",
+    "standing-desk",
+    "logiclink",
+    "cli"
+  ],
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=18"
+  }
+}
