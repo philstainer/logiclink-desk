@@ -886,7 +886,7 @@ async fn run_height_move(
         } else {
             planned_ticks
         };
-        let stop_when_within = if fine_mode && direction == "drive-down" {
+        let stop_when_within = if fine_mode {
             tolerance
         } else {
             base_stop_margin
