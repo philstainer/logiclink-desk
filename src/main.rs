@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use logiclink_desk::ble::{DeskSession, QueryOptions, run_query};
+use logiclink_desk::ble::{DeskSession, HeightMonitor, QueryOptions, run_query};
 use logiclink_desk::commands::{CommandArg, command_payload};
 use logiclink_desk::protocol::{
     decode_packet, decode_slip_stream, encode_packet, resolve_characteristic, slip_encode,
@@ -9,20 +9,18 @@ use logiclink_desk::protocol::{
 use serde_json::json;
 
 const SET_HEIGHT_TOLERANCE: i64 = 3;
-const SET_HEIGHT_BURST_TICKS: u16 = 10;
 const SET_HEIGHT_INTERVAL_MS: u64 = 180;
-const SET_HEIGHT_FINE_TICKS: u16 = 3;
+const SET_HEIGHT_FINE_TICKS: u16 = 1;
 const SET_HEIGHT_FINE_INTERVAL_MS: u64 = 150;
 const SET_HEIGHT_FINE_BAND: i64 = 40;
-const SET_HEIGHT_COAST_MARGIN: i64 = 18;
-const SET_HEIGHT_UP_COAST_MARGIN: i64 = 30;
-const SET_HEIGHT_DOWN_COAST_MARGIN: i64 = 16;
-const SET_HEIGHT_FEEDBACK_LAG_MS: u64 = 250;
-const SET_HEIGHT_SETTLE_MS: u64 = 150;
-const SET_HEIGHT_CORRECTION_SETTLE_MS: u64 = 150;
-const SET_HEIGHT_HEIGHT_POLL_MS: u64 = 50;
+const SET_HEIGHT_SETTLE_MS: u64 = 200;
+const SET_HEIGHT_CORRECTION_SETTLE_MS: u64 = 200;
+const SET_HEIGHT_HEIGHT_POLL_MS: u64 = 60;
 const SET_HEIGHT_REVERSAL_SETTLE_MS: u64 = 0;
 const SET_HEIGHT_RESPONSE_WINDOW_MS: u64 = 150;
+const SET_HEIGHT_STABLE_MS: u64 = 300;
+const SET_HEIGHT_BATCH_MAX_WAIT_MS: u64 = 2_000;
+const SET_HEIGHT_MAX_BATCH_TICKS: u32 = 5;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "LOGIClink desk control tooling")]
@@ -192,6 +190,27 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         interval_ms: u64,
         #[arg(long, default_value_t = 1500)]
+        drain_ms: u64,
+        #[arg(long, default_value_t = 15_000)]
+        scan_timeout_ms: u64,
+        #[arg(long, default_value_t = 15_000)]
+        connect_timeout_ms: u64,
+        #[arg(long, default_value_t = 400)]
+        response_window_ms: u64,
+    },
+    /// Profile motion tick response, notification latency, and coast after the last tick.
+    ProfileMotion {
+        #[arg(default_value = "up")]
+        direction: String,
+        #[arg(default_value_t = 10)]
+        ticks: u16,
+        #[arg(long)]
+        device_name: Option<String>,
+        #[arg(default_value = "app")]
+        characteristic: String,
+        #[arg(long, default_value_t = 180)]
+        interval_ms: u64,
+        #[arg(long, default_value_t = 2_500)]
         drain_ms: u64,
         #[arg(long, default_value_t = 15_000)]
         scan_timeout_ms: u64,
@@ -754,6 +773,32 @@ async fn main() -> anyhow::Result<()> {
                 "runs": runs,
             }))?;
         }
+        Command::ProfileMotion {
+            direction,
+            ticks,
+            device_name,
+            characteristic,
+            interval_ms,
+            drain_ms,
+            scan_timeout_ms,
+            connect_timeout_ms,
+            response_window_ms,
+        } => {
+            let result = run_motion_profile(
+                "profile-motion",
+                &direction,
+                ticks,
+                device_name,
+                characteristic,
+                interval_ms,
+                drain_ms,
+                scan_timeout_ms,
+                connect_timeout_ms,
+                response_window_ms,
+            )
+            .await?;
+            print_json(result)?;
+        }
     }
 
     Ok(())
@@ -762,6 +807,108 @@ async fn main() -> anyhow::Result<()> {
 enum HeightTarget {
     AbsoluteCm(f64),
     RelativeCm(f64),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_motion_profile(
+    action: &str,
+    direction: &str,
+    ticks: u16,
+    device_name: Option<String>,
+    characteristic: String,
+    interval_ms: u64,
+    drain_ms: u64,
+    scan_timeout_ms: u64,
+    connect_timeout_ms: u64,
+    response_window_ms: u64,
+) -> anyhow::Result<serde_json::Value> {
+    let motion_name = motion_command_name(direction)?;
+    let characteristic = resolve_characteristic(&characteristic)?.to_string();
+    let response_window = Duration::from_millis(response_window_ms);
+    let mut session = DeskSession::connect(query_options(
+        device_name.as_deref(),
+        "get-height",
+        Vec::new(),
+        &characteristic,
+        scan_timeout_ms,
+        connect_timeout_ms,
+        response_window_ms,
+        true,
+    ))
+    .await?;
+    let before = session
+        .send_command("get-height", &[], response_window)
+        .await?;
+    let before_height = parsed_height(&before);
+    session.drain_notifications(Duration::from_millis(50)).await;
+
+    let started_at = std::time::Instant::now();
+    let mut events = Vec::new();
+    let mut writes = Vec::new();
+    let args = [CommandArg::Number(1)];
+    let mut last_height: Option<(i64, u128)> = None;
+
+    for tick in 1..=ticks {
+        let tick_started_at = std::time::Instant::now();
+        session.write_command(motion_name, &args).await?;
+        writes.push(json!({
+            "tick": tick,
+            "atMs": started_at.elapsed().as_millis(),
+        }));
+        let notifications = session
+            .drain_available_notifications_timed(started_at)
+            .await;
+        collect_motion_events(
+            &mut events,
+            notifications,
+            started_at,
+            &mut last_height,
+            Some(tick),
+        );
+        let cadence = Duration::from_millis(interval_ms);
+        let elapsed = tick_started_at.elapsed();
+        if elapsed < cadence {
+            tokio::time::sleep(cadence - elapsed).await;
+        }
+    }
+
+    let notifications = session
+        .drain_notifications_timed(Duration::from_millis(drain_ms), started_at)
+        .await;
+    collect_motion_events(
+        &mut events,
+        notifications,
+        started_at,
+        &mut last_height,
+        None,
+    );
+    let after = session
+        .send_command("get-height", &[], response_window)
+        .await?;
+    let after_height = parsed_height(&after);
+    let analysis = motion_analysis(before_height, after_height, &writes, &events);
+    let profile = motion_profile_summary(before_height, after_height, &writes, &events);
+    let device_name = session.device_name().to_string();
+    session.disconnect().await;
+
+    Ok(json!({
+        "deviceName": device_name,
+        "action": action,
+        "direction": motion_name,
+        "ticks": ticks,
+        "intervalMs": interval_ms,
+        "drainMs": drain_ms,
+        "beforeHeight": before_height,
+        "afterHeight": after_height,
+        "observedDelta": match (before_height, after_height) {
+            (Some(start), Some(end)) => Some(end - start),
+            _ => None,
+        },
+        "writes": writes,
+        "events": events,
+        "analysis": analysis,
+        "profile": profile,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -775,20 +922,18 @@ async fn run_height_move(
     connect_timeout_ms: u64,
 ) -> anyhow::Result<()> {
     let tolerance = SET_HEIGHT_TOLERANCE;
-    let burst_ticks = SET_HEIGHT_BURST_TICKS;
     let interval_ms = SET_HEIGHT_INTERVAL_MS;
     let fine_ticks = SET_HEIGHT_FINE_TICKS;
     let fine_interval_ms = SET_HEIGHT_FINE_INTERVAL_MS;
     let fine_band = SET_HEIGHT_FINE_BAND;
-    let coast_margin = SET_HEIGHT_COAST_MARGIN;
-    let up_coast_margin = SET_HEIGHT_UP_COAST_MARGIN;
-    let down_coast_margin = SET_HEIGHT_DOWN_COAST_MARGIN;
-    let feedback_lag_ms = SET_HEIGHT_FEEDBACK_LAG_MS;
     let settle_ms = SET_HEIGHT_SETTLE_MS;
     let correction_settle_ms = SET_HEIGHT_CORRECTION_SETTLE_MS;
     let height_poll_ms = SET_HEIGHT_HEIGHT_POLL_MS;
     let reversal_settle_ms = SET_HEIGHT_REVERSAL_SETTLE_MS;
     let response_window_ms = SET_HEIGHT_RESPONSE_WINDOW_MS;
+    let stable_ms = SET_HEIGHT_STABLE_MS;
+    let batch_max_wait_ms = SET_HEIGHT_BATCH_MAX_WAIT_MS;
+    let max_batch_ticks = SET_HEIGHT_MAX_BATCH_TICKS;
     let characteristic = resolve_characteristic(&characteristic)?.to_string();
     let response_window = Duration::from_millis(response_window_ms);
     let mut session = DeskSession::connect(query_options(
@@ -826,9 +971,13 @@ async fn run_height_move(
         "heightCm": height_units_to_cm(current),
         "deltaToTarget": target_height - current,
     }));
+    let monitor =
+        session.start_height_monitor(Duration::from_millis(height_poll_ms), started_at)?;
+    let mut monitor_sample_index = 0_usize;
 
     let mut correction_count = 0_u32;
     let mut previous_direction: Option<&'static str> = None;
+    let mut observed_units_per_tick = 5.0_f64;
     while (target_height - current).abs() > tolerance {
         if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
             anyhow::bail!("timed out moving to target: current={current} target={target_height}");
@@ -838,27 +987,6 @@ async fn run_height_move(
         let direction = if delta > 0 { "drive-up" } else { "drive-down" };
         let remaining = delta.abs();
         let fine_mode = remaining <= fine_band || correction_count > 0;
-        let direction_coast_margin = match direction {
-            "drive-up" => up_coast_margin,
-            "drive-down" => down_coast_margin,
-            _ => coast_margin,
-        };
-        let feedback_stop_margin =
-            stop_margin_for_feedback_lag(speed_units_per_second(direction), feedback_lag_ms);
-        let base_stop_margin = if fine_mode {
-            match direction {
-                "drive-up" => direction_coast_margin
-                    .max(tolerance)
-                    .max(feedback_stop_margin),
-                _ => (direction_coast_margin / 3)
-                    .max(tolerance)
-                    .max(feedback_stop_margin / 2),
-            }
-        } else {
-            direction_coast_margin
-                .max(tolerance)
-                .max(feedback_stop_margin)
-        };
         let tick_interval = if fine_mode {
             fine_interval_ms
         } else {
@@ -866,102 +994,74 @@ async fn run_height_move(
         };
         let mut tick_count = 0_u32;
         let mut live_heights = Vec::new();
-        let mut height_polls = 0_u32;
+        let starting_poll_count = monitor.poll_count();
         let previous_height = current;
-        let speed_units_per_second = speed_units_per_second(direction);
-        let units_per_tick =
-            speed_units_per_second * Duration::from_millis(tick_interval).as_secs_f64();
         let planned_ticks = if fine_mode {
-            ((remaining.saturating_sub(tolerance)) as f64 / units_per_tick)
-                .ceil()
-                .max(1.0) as u32
+            u32::from(fine_ticks.max(1))
         } else {
-            let planned_distance = (remaining - base_stop_margin).max(1) as f64;
-            ((planned_distance / speed_units_per_second * 1000.0) / tick_interval as f64)
-                .ceil()
-                .max(1.0) as u32
+            let planned_distance = remaining.saturating_sub(fine_band).max(1) as f64;
+            (planned_distance / observed_units_per_tick).ceil().max(1.0) as u32
         };
-        let planned_ticks = if fine_mode {
-            planned_ticks.min(u32::from(fine_ticks.max(1)))
-        } else {
-            planned_ticks
-        };
-        let stop_when_within = if fine_mode {
-            tolerance
-        } else {
-            base_stop_margin
-        };
-
-        session.drain_notifications(Duration::from_millis(50)).await;
+        let planned_ticks = planned_ticks.min(max_batch_ticks).max(1);
 
         let reversing = previous_direction.is_some_and(|previous| previous != direction);
         if reversing {
             tokio::time::sleep(Duration::from_millis(reversal_settle_ms)).await;
         }
 
-        drive_and_poll_height(
+        drive_batch_and_wait_for_stable_height(
             &mut session,
+            &monitor,
             direction,
             planned_ticks,
             Duration::from_millis(tick_interval),
-            Duration::from_millis(height_poll_ms),
-            response_window,
-            target_height,
-            stop_when_within,
             started_at,
             &mut current,
             &mut live_heights,
             &mut tick_count,
-            &mut height_polls,
+            &mut monitor_sample_index,
             Duration::from_millis(timeout_ms),
+            Duration::from_millis(stable_ms),
+            Duration::from_millis(batch_max_wait_ms),
         )
         .await?;
 
         previous_direction = Some(direction);
-        let settle_after_move = if correction_count > 0 {
-            correction_settle_ms
-        } else {
-            settle_ms
-        };
-        current = update_cached_height_during_wait(
-            &mut session,
-            Duration::from_millis(settle_after_move),
-            Duration::from_millis(height_poll_ms),
-            response_window,
-            started_at,
-            current,
-            &mut live_heights,
-            &mut height_polls,
-        )
-        .await?;
+        let height_polls = monitor.poll_count().saturating_sub(starting_poll_count);
+        let observed_delta = (current - previous_height).abs();
+        if tick_count > 0 && observed_delta > 0 {
+            observed_units_per_tick = (observed_delta as f64 / tick_count as f64).clamp(1.0, 20.0);
+        }
         if (target_height - current).signum() != (target_height - previous_height).signum()
             && (target_height - current).abs() > tolerance
         {
             correction_count += 1;
         }
+        let settle_after_move = if correction_count > 0 {
+            correction_settle_ms
+        } else {
+            settle_ms
+        };
         samples.push(json!({
             "label": format!("step-{}", samples.len()),
             "direction": direction,
             "ticks": tick_count,
             "plannedTicks": planned_ticks,
-            "stopWhenWithin": stop_when_within,
             "heightPolls": height_polls,
-            "burstTicks": burst_ticks,
+            "maxBatchTicks": max_batch_ticks,
             "fineTicks": fine_ticks,
-            "unitsPerTick": units_per_tick,
+            "observedUnitsPerTick": observed_units_per_tick,
             "intervalMs": tick_interval,
-            "baseStopMargin": base_stop_margin,
-            "feedbackStopMargin": feedback_stop_margin,
-            "feedbackLagMs": feedback_lag_ms,
             "fineMode": fine_mode,
             "reversing": reversing,
-            "speedUnitsPerSecond": speed_units_per_second,
             "height": current,
             "heightCm": height_units_to_cm(current),
             "deltaToTarget": target_height - current,
             "motionHeights": live_heights,
             "correctionCount": correction_count,
             "settleMs": settle_after_move,
+            "stableMs": stable_ms,
+            "batchMaxWaitMs": batch_max_wait_ms,
             "heightPollMs": height_poll_ms,
             "elapsedMs": started_at.elapsed().as_millis(),
         }));
@@ -973,6 +1073,7 @@ async fn run_height_move(
         }
     }
 
+    monitor.stop().await;
     session.disconnect().await;
     print_json(json!({
         "deviceName": session.device_name(),
@@ -989,13 +1090,12 @@ async fn run_height_move(
         "observedDeltaCm": height_units_to_cm(current - starting_height),
         "withinTolerance": (target_height - current).abs() <= tolerance,
         "elapsedMs": started_at.elapsed().as_millis(),
-        "coastMargin": coast_margin,
-        "upCoastMargin": up_coast_margin,
-        "downCoastMargin": down_coast_margin,
-        "feedbackLagMs": feedback_lag_ms,
         "settleMs": settle_ms,
         "correctionSettleMs": correction_settle_ms,
         "heightPollMs": height_poll_ms,
+        "stableMs": stable_ms,
+        "batchMaxWaitMs": batch_max_wait_ms,
+        "maxBatchTicks": max_batch_ticks,
         "reversalSettleMs": reversal_settle_ms,
         "samples": samples,
     }))?;
@@ -1095,166 +1195,92 @@ fn height_units_to_cm(height_units: i64) -> f64 {
     height_units as f64 / 10.0
 }
 
-fn speed_units_per_second(direction: &str) -> f64 {
-    match direction {
-        "drive-up" => 34.0,
-        "drive-down" => 34.0,
-        _ => 34.0,
-    }
-}
-
-fn stop_margin_for_feedback_lag(speed_units_per_second: f64, feedback_lag_ms: u64) -> i64 {
-    (speed_units_per_second * feedback_lag_ms as f64 / 1000.0).ceil() as i64
-}
-
 #[allow(clippy::too_many_arguments)]
-async fn drive_and_poll_height(
+async fn drive_batch_and_wait_for_stable_height(
     session: &mut DeskSession,
+    monitor: &HeightMonitor,
     direction: &str,
     planned_ticks: u32,
     tick_interval: Duration,
-    height_poll_interval: Duration,
-    height_response_timeout: Duration,
-    target_height: i64,
-    stop_when_within: i64,
     started_at: std::time::Instant,
     current: &mut i64,
     live_heights: &mut Vec<i64>,
     tick_count: &mut u32,
-    height_polls: &mut u32,
+    monitor_sample_index: &mut usize,
     timeout_after: Duration,
+    stable_after_change: Duration,
+    max_wait_after_batch: Duration,
 ) -> anyhow::Result<()> {
-    let mut next_tick_at = tokio::time::Instant::now();
-    let mut next_poll_at = tokio::time::Instant::now() + height_poll_interval;
-    let mut height_request_sent_at: Option<tokio::time::Instant> = None;
-
-    while *tick_count < planned_ticks && (target_height - *current).abs() > stop_when_within {
+    while *tick_count < planned_ticks {
         if started_at.elapsed() >= timeout_after {
-            anyhow::bail!("timed out moving to target: current={current} target={target_height}");
+            anyhow::bail!("timed out moving desk: current={current}");
         }
 
-        let now = tokio::time::Instant::now();
-        if height_request_sent_at.is_some_and(|sent_at| now >= sent_at + height_response_timeout) {
-            height_request_sent_at = None;
-            next_poll_at = now;
-        }
-
-        if now >= next_tick_at {
-            session
-                .write_command(direction, &[CommandArg::Number(1)])
-                .await?;
-            *tick_count += 1;
-            next_tick_at = now + tick_interval;
-        }
-
-        if height_request_sent_at.is_none() && now >= next_poll_at {
-            session.write_command("get-height", &[]).await?;
-            *height_polls += 1;
-            height_request_sent_at = Some(now);
-            next_poll_at = now + height_poll_interval;
-        }
-
-        if update_height_from_available_notifications(session, started_at, current, live_heights)
-            .await
-            > 0
-        {
-            height_request_sent_at = None;
-        }
-
-        let next_height_wake = height_request_sent_at
-            .map(|sent_at| sent_at + height_response_timeout)
-            .unwrap_or(next_poll_at);
-        let sleep_until = next_tick_at.min(next_height_wake);
-        let now = tokio::time::Instant::now();
-        if sleep_until > now {
-            tokio::time::sleep((sleep_until - now).min(Duration::from_millis(10))).await;
-        }
+        session
+            .write_command(direction, &[CommandArg::Number(1)])
+            .await?;
+        *tick_count += 1;
+        tokio::time::sleep(tick_interval).await;
+        update_height_from_monitor(monitor, current, live_heights, monitor_sample_index);
     }
 
-    update_height_from_available_notifications(session, started_at, current, live_heights).await;
+    wait_for_stable_height_after_batch(
+        monitor,
+        current,
+        live_heights,
+        monitor_sample_index,
+        stable_after_change,
+        max_wait_after_batch,
+    )
+    .await;
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn update_cached_height_during_wait(
-    session: &mut DeskSession,
-    duration: Duration,
-    height_poll_interval: Duration,
-    height_response_timeout: Duration,
-    started_at: std::time::Instant,
-    mut current: i64,
-    live_heights: &mut Vec<i64>,
-    height_polls: &mut u32,
-) -> anyhow::Result<i64> {
-    let deadline = tokio::time::Instant::now() + duration;
-    let mut next_poll_at = tokio::time::Instant::now();
-    let starting_height_count = live_heights.len();
-    let mut height_request_sent_at: Option<tokio::time::Instant> = None;
-
-    while tokio::time::Instant::now() < deadline {
-        let now = tokio::time::Instant::now();
-        if height_request_sent_at.is_some_and(|sent_at| now >= sent_at + height_response_timeout) {
-            height_request_sent_at = None;
-            next_poll_at = now;
-        }
-
-        if height_request_sent_at.is_none() && now >= next_poll_at {
-            session.write_command("get-height", &[]).await?;
-            *height_polls += 1;
-            height_request_sent_at = Some(now);
-            next_poll_at = now + height_poll_interval;
-        }
-
-        if update_height_from_available_notifications(
-            session,
-            started_at,
-            &mut current,
-            live_heights,
-        )
-        .await
-            > 0
-        {
-            height_request_sent_at = None;
-        }
-        if live_heights.len() > starting_height_count {
-            return Ok(current);
-        }
-
-        let now = tokio::time::Instant::now();
-        let next_height_wake = height_request_sent_at
-            .map(|sent_at| sent_at + height_response_timeout)
-            .unwrap_or(next_poll_at);
-        let sleep_until = next_height_wake.min(deadline);
-        if sleep_until > now {
-            tokio::time::sleep((sleep_until - now).min(Duration::from_millis(10))).await;
-        }
-    }
-
-    update_height_from_available_notifications(session, started_at, &mut current, live_heights)
-        .await;
-    if live_heights.len() > starting_height_count {
-        return Ok(current);
-    }
-
-    Ok(current)
-}
-
-async fn update_height_from_available_notifications(
-    session: &mut DeskSession,
-    started_at: std::time::Instant,
+async fn wait_for_stable_height_after_batch(
+    monitor: &HeightMonitor,
     current: &mut i64,
     live_heights: &mut Vec<i64>,
-) -> usize {
-    let notifications = session
-        .drain_available_notifications_timed(started_at)
-        .await;
-    let mut updated = 0;
-    for height in notifications.iter().filter_map(notification_height) {
-        *current = height;
-        live_heights.push(height);
-        updated += 1;
+    monitor_sample_index: &mut usize,
+    stable_after_change: Duration,
+    max_wait_after_batch: Duration,
+) {
+    update_height_from_monitor(monitor, current, live_heights, monitor_sample_index);
+    let started_waiting = tokio::time::Instant::now();
+    let deadline = started_waiting + max_wait_after_batch;
+    let mut last_height = *current;
+    let mut saw_change = false;
+    let mut stable_since = tokio::time::Instant::now();
+    while tokio::time::Instant::now() < deadline {
+        let before = *current;
+        update_height_from_monitor(monitor, current, live_heights, monitor_sample_index);
+        if *current != before {
+            saw_change = true;
+        }
+        if *current != last_height {
+            last_height = *current;
+            stable_since = tokio::time::Instant::now();
+        }
+        if saw_change && stable_since.elapsed() >= stable_after_change {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    updated
+    update_height_from_monitor(monitor, current, live_heights, monitor_sample_index);
+}
+
+fn update_height_from_monitor(
+    monitor: &HeightMonitor,
+    current: &mut i64,
+    live_heights: &mut Vec<i64>,
+    monitor_sample_index: &mut usize,
+) -> usize {
+    let (next_index, samples) = monitor.samples_since(*monitor_sample_index);
+    *monitor_sample_index = next_index;
+    if let Some(height) = samples.last().map(|sample| sample.height) {
+        *current = height;
+    }
+    live_heights.extend(samples.into_iter().map(|sample| sample.height));
+    live_heights.len()
 }
 
 fn collect_motion_events(
@@ -1349,6 +1375,86 @@ fn motion_analysis(
             _ => None,
         },
         "maxAbsDerivedSpeedUnitsPerSecond": max_abs_speed,
+    })
+}
+
+fn motion_profile_summary(
+    before_height: Option<i64>,
+    after_height: Option<i64>,
+    writes: &[serde_json::Value],
+    events: &[serde_json::Value],
+) -> serde_json::Value {
+    let first_write_ms = writes
+        .first()
+        .and_then(|item| item.get("atMs"))
+        .and_then(|value| value.as_u64());
+    let last_write_ms = writes
+        .last()
+        .and_then(|item| item.get("atMs"))
+        .and_then(|value| value.as_u64());
+    let first_change = before_height.and_then(|start| {
+        events.iter().find_map(|event| {
+            let height = event.get("height")?.as_i64()?;
+            (height != start).then_some(event)
+        })
+    });
+    let first_change_ms = first_change
+        .and_then(|event| event.get("atMs"))
+        .and_then(|value| value.as_u64());
+    let last_change = events.windows(2).rev().find_map(|pair| {
+        let previous = pair[0].get("height")?.as_i64()?;
+        let current = pair[1].get("height")?.as_i64()?;
+        (previous != current).then_some(&pair[1])
+    });
+    let last_change_ms = last_change
+        .and_then(|event| event.get("atMs"))
+        .and_then(|value| value.as_u64());
+    let last_change_height = last_change
+        .and_then(|event| event.get("height"))
+        .and_then(|value| value.as_i64());
+    let first_change_height = first_change
+        .and_then(|event| event.get("height"))
+        .and_then(|value| value.as_i64());
+    let movement_after_last_write = match (last_write_ms, events.last()) {
+        (Some(last_write_ms), Some(_)) => {
+            let height_at_last_write = events
+                .iter()
+                .rev()
+                .find(|event| {
+                    event
+                        .get("atMs")
+                        .and_then(|value| value.as_u64())
+                        .is_some_and(|at_ms| at_ms <= last_write_ms)
+                })
+                .and_then(|event| event.get("height"))
+                .and_then(|value| value.as_i64())
+                .or(before_height);
+            match (height_at_last_write, after_height) {
+                (Some(start), Some(end)) => Some(end - start),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+
+    json!({
+        "firstChangeLatencyMs": match (first_write_ms, first_change_ms) {
+            (Some(write), Some(change)) => change.checked_sub(write),
+            _ => None,
+        },
+        "lastChangeAfterLastWriteMs": match (last_write_ms, last_change_ms) {
+            (Some(write), Some(change)) => change.checked_sub(write),
+            _ => None,
+        },
+        "firstChangeHeight": first_change_height,
+        "lastChangeHeight": last_change_height,
+        "movementAfterLastWrite": movement_after_last_write,
+        "unitsPerTick": match (before_height, after_height) {
+            (Some(before), Some(after)) if !writes.is_empty() => {
+                Some((after - before) as f64 / writes.len() as f64)
+            }
+            _ => None,
+        },
     })
 }
 
@@ -1450,12 +1556,6 @@ fn percentile_nearest_rank(sorted: &[u128], percentile: usize) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn feedback_lag_margin_rounds_up_movement_during_lag() {
-        assert_eq!(stop_margin_for_feedback_lag(34.0, 250), 9);
-        assert_eq!(stop_margin_for_feedback_lag(34.0, 0), 0);
-    }
 
     #[test]
     fn set_height_target_uses_centimetres() {

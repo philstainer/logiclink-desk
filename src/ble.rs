@@ -1,3 +1,7 @@
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use btleplug::api::{
@@ -8,6 +12,8 @@ use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::{StreamExt, stream::BoxStream};
 use serde::Serialize;
 use thiserror::Error;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
 use uuid::Uuid;
 
@@ -51,7 +57,28 @@ pub struct DeskSession {
     peripheral: Peripheral,
     characteristic: Characteristic,
     characteristic_uuid: Uuid,
-    notifications: BoxStream<'static, ValueNotification>,
+    notifications: Option<BoxStream<'static, ValueNotification>>,
+    write_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HeightSample {
+    #[serde(rename = "receivedAtMs")]
+    pub received_at_ms: u128,
+    pub height: i64,
+}
+
+#[derive(Default)]
+struct HeightMonitorState {
+    latest_height: Option<i64>,
+    samples: Vec<HeightSample>,
+    polls: u32,
+}
+
+pub struct HeightMonitor {
+    state: Arc<StdMutex<HeightMonitorState>>,
+    stop: Arc<AtomicBool>,
+    task: JoinHandle<()>,
 }
 
 #[derive(Debug, Error)]
@@ -71,6 +98,8 @@ pub enum BleError {
     MultipleDevices(String),
     #[error("discovered matching desk without a Bluetooth device name")]
     MissingDeviceName,
+    #[error("height monitor is already running for this session")]
+    HeightMonitorAlreadyStarted,
     #[error("LOGIClink service not found: {0}")]
     ServiceNotFound(String),
     #[error("LOGIClink characteristic not found: {0}")]
@@ -136,7 +165,8 @@ impl DeskSession {
             peripheral,
             characteristic,
             characteristic_uuid,
-            notifications,
+            notifications: Some(notifications),
+            write_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -161,9 +191,7 @@ impl DeskSession {
         let frame = slip_encode(&encode_packet(command, &payload, None));
         let requested_command = format!("0x{command:02x}");
 
-        self.peripheral
-            .write(&self.characteristic, &frame, WriteType::WithoutResponse)
-            .await?;
+        self.write_frame(&frame).await?;
 
         let notifications = self
             .collect_until_command_response(command, response_window, quiet_window)
@@ -194,14 +222,70 @@ impl DeskSession {
     ) -> Result<String, BleError> {
         let (command, payload) = command_payload(query, args)?;
         let frame = slip_encode(&encode_packet(command, &payload, None));
-        self.peripheral
-            .write(&self.characteristic, &frame, WriteType::WithoutResponse)
-            .await?;
+        self.write_frame(&frame).await?;
         Ok(hex::encode(frame))
     }
 
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    pub fn start_height_monitor(
+        &mut self,
+        poll_interval: Duration,
+        started_at: std::time::Instant,
+    ) -> Result<HeightMonitor, BleError> {
+        let mut notifications = self
+            .notifications
+            .take()
+            .ok_or(BleError::HeightMonitorAlreadyStarted)?;
+        let (command, payload) = command_payload("get-height", &[])?;
+        let frame = slip_encode(&encode_packet(command, &payload, None));
+        let peripheral = self.peripheral.clone();
+        let characteristic = self.characteristic.clone();
+        let write_lock = self.write_lock.clone();
+        let state = Arc::new(StdMutex::new(HeightMonitorState::default()));
+        let task_state = state.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let task_stop = stop.clone();
+        let task = tokio::spawn(async move {
+            let mut next_poll_at = tokio::time::Instant::now();
+            while !task_stop.load(Ordering::Relaxed) {
+                let now = tokio::time::Instant::now();
+                if now >= next_poll_at {
+                    let _guard = write_lock.lock().await;
+                    if peripheral
+                        .write(&characteristic, &frame, WriteType::WithoutResponse)
+                        .await
+                        .is_ok()
+                        && let Ok(mut state) = task_state.lock()
+                    {
+                        state.polls += 1;
+                    }
+                    next_poll_at = now + poll_interval;
+                }
+
+                match timeout(Duration::from_millis(10), notifications.next()).await {
+                    Ok(Some(notification)) => {
+                        for value in decode_notification(&notification.value) {
+                            if let Some(height) = notification_height(&value) {
+                                let sample = HeightSample {
+                                    received_at_ms: started_at.elapsed().as_millis(),
+                                    height,
+                                };
+                                if let Ok(mut state) = task_state.lock() {
+                                    state.latest_height = Some(height);
+                                    state.samples.push(sample);
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+        });
+        Ok(HeightMonitor { state, stop, task })
     }
 
     pub async fn drain_notifications(
@@ -225,7 +309,7 @@ impl DeskSession {
     pub async fn drain_available_notifications(&mut self) -> Vec<serde_json::Value> {
         let mut notifications = Vec::new();
         while let Ok(Some(notification)) =
-            timeout(Duration::from_millis(1), self.notifications.next()).await
+            timeout(Duration::from_millis(1), self.notifications_mut().next()).await
         {
             notifications.push(notification.value);
         }
@@ -238,7 +322,7 @@ impl DeskSession {
     ) -> Vec<serde_json::Value> {
         let mut notifications = Vec::new();
         while let Ok(Some(notification)) =
-            timeout(Duration::from_millis(1), self.notifications.next()).await
+            timeout(Duration::from_millis(1), self.notifications_mut().next()).await
         {
             notifications.push((notification.value, started_at.elapsed().as_millis()));
         }
@@ -250,7 +334,7 @@ impl DeskSession {
         let mut notifications = Vec::new();
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match timeout(remaining, self.notifications.next()).await {
+            match timeout(remaining, self.notifications_mut().next()).await {
                 Ok(Some(notification)) => notifications.push(notification.value),
                 Ok(None) => break,
                 Err(_) => break,
@@ -268,7 +352,7 @@ impl DeskSession {
         let mut notifications = Vec::new();
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match timeout(remaining, self.notifications.next()).await {
+            match timeout(remaining, self.notifications_mut().next()).await {
                 Ok(Some(notification)) => {
                     notifications.push((notification.value, started_at.elapsed().as_millis()));
                 }
@@ -289,7 +373,7 @@ impl DeskSession {
         let mut notifications = Vec::new();
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match timeout(remaining, self.notifications.next()).await {
+            match timeout(remaining, self.notifications_mut().next()).await {
                 Ok(Some(notification)) => {
                     let is_requested_command =
                         notification_matches_command(&notification.value, command);
@@ -310,15 +394,58 @@ impl DeskSession {
 
     async fn collect_quiet(&mut self, quiet_window: Duration) -> Vec<Vec<u8>> {
         let mut notifications = Vec::new();
-        while let Ok(Some(notification)) = timeout(quiet_window, self.notifications.next()).await {
+        while let Ok(Some(notification)) =
+            timeout(quiet_window, self.notifications_mut().next()).await
+        {
             notifications.push(notification.value);
         }
         notifications
     }
 
+    async fn write_frame(&self, frame: &[u8]) -> Result<(), BleError> {
+        let _guard = self.write_lock.lock().await;
+        self.peripheral
+            .write(&self.characteristic, frame, WriteType::WithoutResponse)
+            .await?;
+        Ok(())
+    }
+
+    fn notifications_mut(&mut self) -> &mut BoxStream<'static, ValueNotification> {
+        self.notifications
+            .as_mut()
+            .expect("notification stream is owned by height monitor")
+    }
+
     pub async fn disconnect(&self) {
         self.peripheral.unsubscribe(&self.characteristic).await.ok();
         self.peripheral.disconnect().await.ok();
+    }
+}
+
+impl HeightMonitor {
+    pub fn latest_height(&self) -> Option<i64> {
+        self.state.lock().ok()?.latest_height
+    }
+
+    pub fn samples_since(&self, index: usize) -> (usize, Vec<HeightSample>) {
+        let Ok(state) = self.state.lock() else {
+            return (index, Vec::new());
+        };
+        let next_index = state.samples.len();
+        let samples = state.samples.get(index..).unwrap_or_default().to_vec();
+        (next_index, samples)
+    }
+
+    pub fn poll_count(&self) -> u32 {
+        self.state
+            .lock()
+            .map(|state| state.polls)
+            .unwrap_or_default()
+    }
+
+    pub async fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.task.await.ok();
     }
 }
 
@@ -463,6 +590,10 @@ fn notification_matches_command(notification: &[u8], command: u8) -> bool {
         Ok(decoded) => decoded.frames.iter().any(|frame| frame.command == command),
         Err(_) => false,
     }
+}
+
+fn notification_height(value: &serde_json::Value) -> Option<i64> {
+    value.get("parsed")?.get("height")?.as_i64()
 }
 
 async fn timeout_named<T, F>(
