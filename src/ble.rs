@@ -10,6 +10,7 @@ use btleplug::api::{
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::{StreamExt, stream::BoxStream};
+use rand::RngCore;
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -45,6 +46,10 @@ pub struct QueryResult {
     pub wrote: String,
     #[serde(rename = "requestedCommand")]
     pub requested_command: String,
+    #[serde(rename = "requestedNonce")]
+    pub requested_nonce: String,
+    #[serde(rename = "matchKind")]
+    pub match_kind: String,
     #[serde(rename = "matchedNotifications")]
     pub matched_notifications: Vec<serde_json::Value>,
     #[serde(rename = "otherNotifications")]
@@ -188,20 +193,50 @@ impl DeskSession {
         quiet_window: Duration,
     ) -> Result<QueryResult, BleError> {
         let (command, payload) = command_payload(query, args)?;
-        let frame = slip_encode(&encode_packet(command, &payload, None));
+        let nonce = random_nonce();
+        let frame = slip_encode(&encode_packet(command, &payload, Some(nonce)));
         let requested_command = format!("0x{command:02x}");
+        let requested_nonce = hex::encode(nonce);
 
         self.write_frame(&frame).await?;
 
         let notifications = self
-            .collect_until_command_response(command, response_window, quiet_window)
+            .collect_until_command_response(command, nonce, response_window, quiet_window)
             .await;
 
         let decoded = decode_notifications(notifications);
-        let (matched_notifications, other_notifications): (Vec<_>, Vec<_>) =
-            decoded.iter().cloned().partition(|item| {
-                item.get("command").and_then(|value| value.as_str()) == Some(&requested_command)
-            });
+        let exact_matches = decoded
+            .iter()
+            .filter(|item| {
+                notification_value_matches_request(item, &requested_command, &requested_nonce)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let command_matches = decoded
+            .iter()
+            .filter(|item| notification_value_matches_command(item, &requested_command))
+            .cloned()
+            .collect::<Vec<_>>();
+        let exact_match_found = !exact_matches.is_empty();
+        let command_match_found = !command_matches.is_empty();
+        let (matched_notifications, match_kind) = if exact_match_found {
+            (exact_matches, "command-and-nonce")
+        } else if command_match_found {
+            (command_matches, "command-only-fallback")
+        } else {
+            (Vec::new(), "none")
+        };
+        let other_notifications = decoded
+            .iter()
+            .filter(|item| {
+                if exact_match_found {
+                    !notification_value_matches_request(item, &requested_command, &requested_nonce)
+                } else {
+                    !notification_value_matches_command(item, &requested_command)
+                }
+            })
+            .cloned()
+            .collect::<Vec<_>>();
 
         Ok(QueryResult {
             device_name: self.device_name.clone(),
@@ -209,6 +244,8 @@ impl DeskSession {
             characteristic: self.characteristic_uuid.simple().to_string(),
             wrote: hex::encode(frame),
             requested_command,
+            requested_nonce,
+            match_kind: match_kind.to_string(),
             matched_notifications,
             other_notifications,
             notifications: decoded,
@@ -366,6 +403,7 @@ impl DeskSession {
     async fn collect_until_command_response(
         &mut self,
         command: u8,
+        nonce: [u8; 2],
         response_window: Duration,
         quiet_window: Duration,
     ) -> Vec<Vec<u8>> {
@@ -376,7 +414,7 @@ impl DeskSession {
             match timeout(remaining, self.notifications_mut().next()).await {
                 Ok(Some(notification)) => {
                     let is_requested_command =
-                        notification_matches_command(&notification.value, command);
+                        notification_matches_request(&notification.value, command, nonce);
                     notifications.push(notification.value);
                     if is_requested_command {
                         if !quiet_window.is_zero() {
@@ -572,6 +610,7 @@ fn decode_notification(notification: &[u8]) -> Vec<serde_json::Value> {
                     "command": frame.command_hex,
                     "commandName": frame.command_name,
                     "status": frame.status,
+                    "nonce": frame.nonce,
                     "payload": hex::encode(frame.payload),
                     "parsed": frame.parsed,
                     "trailingRemainder": hex::encode(&decoded.remainder),
@@ -585,15 +624,38 @@ fn decode_notification(notification: &[u8]) -> Vec<serde_json::Value> {
     }
 }
 
-fn notification_matches_command(notification: &[u8], command: u8) -> bool {
+fn notification_matches_request(notification: &[u8], command: u8, nonce: [u8; 2]) -> bool {
+    let nonce = hex::encode(nonce);
     match decode_slip_stream(notification) {
-        Ok(decoded) => decoded.frames.iter().any(|frame| frame.command == command),
+        Ok(decoded) => decoded
+            .frames
+            .iter()
+            .any(|frame| frame.command == command && frame.nonce == nonce),
         Err(_) => false,
     }
 }
 
+fn notification_value_matches_request(
+    value: &serde_json::Value,
+    command: &str,
+    nonce: &str,
+) -> bool {
+    notification_value_matches_command(value, command)
+        && value.get("nonce").and_then(|value| value.as_str()) == Some(nonce)
+}
+
+fn notification_value_matches_command(value: &serde_json::Value, command: &str) -> bool {
+    value.get("command").and_then(|value| value.as_str()) == Some(command)
+}
+
 fn notification_height(value: &serde_json::Value) -> Option<i64> {
     value.get("parsed")?.get("height")?.as_i64()
+}
+
+fn random_nonce() -> [u8; 2] {
+    let mut nonce = [0_u8; 2];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    nonce
 }
 
 async fn timeout_named<T, F>(

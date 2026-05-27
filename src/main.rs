@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use logiclink_desk::ble::{DeskSession, QueryOptions, run_query};
+use logiclink_desk::ble::{DeskSession, QueryOptions, QueryResult, run_query};
 use logiclink_desk::commands::{CommandArg, command_payload};
 use logiclink_desk::protocol::{
     decode_packet, decode_slip_stream, encode_packet, resolve_characteristic, slip_encode,
@@ -15,6 +15,8 @@ const SET_HEIGHT_FINE_UNITS_PER_TICK: f64 = 3.0;
 const SET_HEIGHT_FINE_SETTLE_MS: u64 = 2_500;
 const SET_HEIGHT_BURST_SETTLE_MS: u64 = 2_500;
 const SET_HEIGHT_RESPONSE_WINDOW_MS: u64 = 150;
+const DEFAULT_MIN_HEIGHT_CM: f64 = 60.0;
+const DEFAULT_MAX_HEIGHT_CM: f64 = 130.0;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "LOGIClink desk control tooling")]
@@ -124,6 +126,10 @@ enum Command {
         scan_timeout_ms: u64,
         #[arg(long, default_value_t = 15_000)]
         connect_timeout_ms: u64,
+        #[arg(long, default_value_t = DEFAULT_MIN_HEIGHT_CM)]
+        min_height_cm: f64,
+        #[arg(long, default_value_t = DEFAULT_MAX_HEIGHT_CM)]
+        max_height_cm: f64,
     },
     /// Move by a signed height delta in centimetres.
     AdjustHeight {
@@ -140,6 +146,10 @@ enum Command {
         scan_timeout_ms: u64,
         #[arg(long, default_value_t = 15_000)]
         connect_timeout_ms: u64,
+        #[arg(long, default_value_t = DEFAULT_MIN_HEIGHT_CM)]
+        min_height_cm: f64,
+        #[arg(long, default_value_t = DEFAULT_MAX_HEIGHT_CM)]
+        max_height_cm: f64,
     },
     /// Raise the desk by a height delta in centimetres.
     Raise {
@@ -155,6 +165,10 @@ enum Command {
         scan_timeout_ms: u64,
         #[arg(long, default_value_t = 15_000)]
         connect_timeout_ms: u64,
+        #[arg(long, default_value_t = DEFAULT_MIN_HEIGHT_CM)]
+        min_height_cm: f64,
+        #[arg(long, default_value_t = DEFAULT_MAX_HEIGHT_CM)]
+        max_height_cm: f64,
     },
     /// Lower the desk by a height delta in centimetres.
     Lower {
@@ -170,6 +184,10 @@ enum Command {
         scan_timeout_ms: u64,
         #[arg(long, default_value_t = 15_000)]
         connect_timeout_ms: u64,
+        #[arg(long, default_value_t = DEFAULT_MIN_HEIGHT_CM)]
+        min_height_cm: f64,
+        #[arg(long, default_value_t = DEFAULT_MAX_HEIGHT_CM)]
+        max_height_cm: f64,
     },
     /// Stream jog ticks and print live height notifications with derived speed.
     WatchMotion {
@@ -264,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
                 },
                 "decodedCheck": {
                     "command": format!("0x{:02x}", decoded.command),
+                    "nonce": hex::encode(decoded.nonce),
                     "payload": hex::encode(decoded.payload),
                 },
             }))?;
@@ -277,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
                     "frames": [{
                         "command": format!("0x{:02x}", decoded.command),
                         "status": decoded.status,
+                        "nonce": hex::encode(decoded.nonce),
                         "payload": hex::encode(decoded.payload),
                         "plain": hex::encode(decoded.plain),
                     }],
@@ -332,14 +352,18 @@ async fn main() -> anyhow::Result<()> {
                 false,
             ))
             .await?;
-            let height = read_height(&mut session, response_window).await?;
+            let result = async {
+                let height = read_height(&mut session, response_window).await?;
+                Ok::<_, anyhow::Error>(json!({
+                    "deviceName": session.device_name(),
+                    "action": "height",
+                    "height": height,
+                    "heightCm": height_units_to_cm(height),
+                }))
+            }
+            .await;
             session.disconnect().await;
-            print_json(json!({
-                "deviceName": session.device_name(),
-                "action": "height",
-                "height": height,
-                "heightCm": height_units_to_cm(height),
-            }))?;
+            print_json(result?)?;
         }
         Command::Pulse {
             direction,
@@ -368,68 +392,72 @@ async fn main() -> anyhow::Result<()> {
                 false,
             ))
             .await?;
-            let before = session
-                .send_command("get-height", &[], response_window)
-                .await?;
-            let starting_height = parsed_height(&before);
-            let mut final_height = starting_height;
-            let mut stopped_reason = if target_reached(motion_name, starting_height, target_height)
-            {
-                Some("target-already-reached")
-            } else {
-                None
-            };
-            samples.push(json!({
-                "label": "before",
-                "height": starting_height,
-                "result": before,
-            }));
-
-            for tick in 1..=ticks {
-                if stopped_reason.is_some() {
-                    break;
-                }
-                let motion_args = [CommandArg::Number(1)];
-                let motion = session
-                    .send_command(motion_name, &motion_args, response_window)
-                    .await?;
-                tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-                let height = session
+            let result = async {
+                let before = session
                     .send_command("get-height", &[], response_window)
                     .await?;
-                let current_height = parsed_height(&height);
-                final_height = current_height;
-                if target_reached(motion_name, current_height, target_height) {
-                    stopped_reason = Some("target-reached");
-                }
+                let starting_height = parsed_height(&before);
+                let mut final_height = starting_height;
+                let mut stopped_reason =
+                    if target_reached(motion_name, starting_height, target_height) {
+                        Some("target-already-reached")
+                    } else {
+                        None
+                    };
                 samples.push(json!({
-                    "label": format!("tick-{tick}"),
-                    "motionHeight": parsed_height(&motion),
-                    "height": current_height,
-                    "motion": motion,
-                    "result": height,
+                    "label": "before",
+                    "height": starting_height,
+                    "result": before,
                 }));
-            }
-            session.disconnect().await;
 
-            let stopped_reason = stopped_reason.unwrap_or("max-ticks-reached");
-            print_json(json!({
-                "deviceName": session.device_name(),
-                "action": "pulse",
-                "direction": motion_name,
-                "ticks": ticks,
-                "targetHeight": target_height,
-                "stoppedReason": stopped_reason,
-                "targetReached": stopped_reason == "target-already-reached" || stopped_reason == "target-reached",
-                "intervalMs": interval_ms,
-                "startingHeight": starting_height,
-                "finalHeight": final_height,
-                "observedDelta": match (starting_height, final_height) {
-                    (Some(start), Some(end)) => Some(end - start),
-                    _ => None,
-                },
-                "samples": samples,
-            }))?;
+                for tick in 1..=ticks {
+                    if stopped_reason.is_some() {
+                        break;
+                    }
+                    let motion_args = [CommandArg::Number(1)];
+                    let motion = session
+                        .send_command(motion_name, &motion_args, response_window)
+                        .await?;
+                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    let height = session
+                        .send_command("get-height", &[], response_window)
+                        .await?;
+                    let current_height = parsed_height(&height);
+                    final_height = current_height;
+                    if target_reached(motion_name, current_height, target_height) {
+                        stopped_reason = Some("target-reached");
+                    }
+                    samples.push(json!({
+                        "label": format!("tick-{tick}"),
+                        "motionHeight": parsed_height(&motion),
+                        "height": current_height,
+                        "motion": motion,
+                        "result": height,
+                    }));
+                }
+
+                let stopped_reason = stopped_reason.unwrap_or("max-ticks-reached");
+                Ok::<_, anyhow::Error>(json!({
+                    "deviceName": session.device_name(),
+                    "action": "pulse",
+                    "direction": motion_name,
+                    "ticks": ticks,
+                    "targetHeight": target_height,
+                    "stoppedReason": stopped_reason,
+                    "targetReached": stopped_reason == "target-already-reached" || stopped_reason == "target-reached",
+                    "intervalMs": interval_ms,
+                    "startingHeight": starting_height,
+                    "finalHeight": final_height,
+                    "observedDelta": match (starting_height, final_height) {
+                        (Some(start), Some(end)) => Some(end - start),
+                        _ => None,
+                    },
+                    "samples": samples,
+                }))
+            }
+            .await;
+            session.disconnect().await;
+            print_json(result?)?;
         }
         Command::Burst {
             direction,
@@ -456,52 +484,55 @@ async fn main() -> anyhow::Result<()> {
             ))
             .await?;
 
-            let before = session
-                .send_command("get-height", &[], response_window)
-                .await?;
-            let starting_height = parsed_height(&before);
-            let motion_args = [CommandArg::Number(1)];
-            let started_at = std::time::Instant::now();
-            let mut motions = Vec::new();
+            let result = async {
+                let before = session
+                    .send_command("get-height", &[], response_window)
+                    .await?;
+                let starting_height = parsed_height(&before);
+                let motion_args = [CommandArg::Number(1)];
+                let started_at = std::time::Instant::now();
+                let mut motions = Vec::new();
 
-            for tick in 1..=ticks {
-                let wrote = session.write_command(motion_name, &motion_args).await?;
-                motions.push(json!({
-                    "tick": tick,
-                    "wrote": wrote,
-                }));
-                if tick < ticks && interval_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                for tick in 1..=ticks {
+                    let wrote = session.write_command(motion_name, &motion_args).await?;
+                    motions.push(json!({
+                        "tick": tick,
+                        "wrote": wrote,
+                    }));
+                    if tick < ticks && interval_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    }
                 }
+
+                let motion_notifications = session.drain_notifications(response_window).await;
+
+                let after = session
+                    .send_command("get-height", &[], response_window)
+                    .await?;
+                let final_height = parsed_height(&after);
+                Ok::<_, anyhow::Error>(json!({
+                    "deviceName": session.device_name(),
+                    "action": "burst",
+                    "direction": motion_name,
+                    "ticks": ticks,
+                    "intervalMs": interval_ms,
+                    "responseWindowMs": response_window_ms,
+                    "elapsedMs": started_at.elapsed().as_millis(),
+                    "startingHeight": starting_height,
+                    "finalHeight": final_height,
+                    "observedDelta": match (starting_height, final_height) {
+                        (Some(start), Some(end)) => Some(end - start),
+                        _ => None,
+                    },
+                    "before": before,
+                    "motions": motions,
+                    "motionNotifications": motion_notifications,
+                    "after": after,
+                }))
             }
-
-            let motion_notifications = session.drain_notifications(response_window).await;
-
-            let after = session
-                .send_command("get-height", &[], response_window)
-                .await?;
-            let final_height = parsed_height(&after);
+            .await;
             session.disconnect().await;
-
-            print_json(json!({
-                "deviceName": session.device_name(),
-                "action": "burst",
-                "direction": motion_name,
-                "ticks": ticks,
-                "intervalMs": interval_ms,
-                "responseWindowMs": response_window_ms,
-                "elapsedMs": started_at.elapsed().as_millis(),
-                "startingHeight": starting_height,
-                "finalHeight": final_height,
-                "observedDelta": match (starting_height, final_height) {
-                    (Some(start), Some(end)) => Some(end - start),
-                    _ => None,
-                },
-                "before": before,
-                "motions": motions,
-                "motionNotifications": motion_notifications,
-                "after": after,
-            }))?;
+            print_json(result?)?;
         }
         Command::SetHeight {
             target_height_cm,
@@ -510,6 +541,8 @@ async fn main() -> anyhow::Result<()> {
             timeout_ms,
             scan_timeout_ms,
             connect_timeout_ms,
+            min_height_cm,
+            max_height_cm,
         } => {
             run_height_move(
                 "set-height",
@@ -519,6 +552,8 @@ async fn main() -> anyhow::Result<()> {
                 timeout_ms,
                 scan_timeout_ms,
                 connect_timeout_ms,
+                min_height_cm,
+                max_height_cm,
             )
             .await?;
         }
@@ -529,6 +564,8 @@ async fn main() -> anyhow::Result<()> {
             timeout_ms,
             scan_timeout_ms,
             connect_timeout_ms,
+            min_height_cm,
+            max_height_cm,
         } => {
             run_height_move(
                 "adjust-height",
@@ -538,6 +575,8 @@ async fn main() -> anyhow::Result<()> {
                 timeout_ms,
                 scan_timeout_ms,
                 connect_timeout_ms,
+                min_height_cm,
+                max_height_cm,
             )
             .await?;
         }
@@ -548,6 +587,8 @@ async fn main() -> anyhow::Result<()> {
             timeout_ms,
             scan_timeout_ms,
             connect_timeout_ms,
+            min_height_cm,
+            max_height_cm,
         } => {
             run_height_move(
                 "raise",
@@ -557,6 +598,8 @@ async fn main() -> anyhow::Result<()> {
                 timeout_ms,
                 scan_timeout_ms,
                 connect_timeout_ms,
+                min_height_cm,
+                max_height_cm,
             )
             .await?;
         }
@@ -567,6 +610,8 @@ async fn main() -> anyhow::Result<()> {
             timeout_ms,
             scan_timeout_ms,
             connect_timeout_ms,
+            min_height_cm,
+            max_height_cm,
         } => {
             run_height_move(
                 "lower",
@@ -576,6 +621,8 @@ async fn main() -> anyhow::Result<()> {
                 timeout_ms,
                 scan_timeout_ms,
                 connect_timeout_ms,
+                min_height_cm,
+                max_height_cm,
             )
             .await?;
         }
@@ -604,76 +651,79 @@ async fn main() -> anyhow::Result<()> {
                 true,
             ))
             .await?;
-            let before = session
-                .send_command("get-height", &[], response_window)
-                .await?;
-            let before_height = parsed_height(&before);
-            session.drain_notifications(Duration::from_millis(50)).await;
+            let result = async {
+                let before = session
+                    .send_command("get-height", &[], response_window)
+                    .await?;
+                let before_height = parsed_height(&before);
+                session.drain_notifications(Duration::from_millis(50)).await;
 
-            let started_at = std::time::Instant::now();
-            let mut events = Vec::new();
-            let mut writes = Vec::new();
-            let args = [CommandArg::Number(1)];
-            let mut last_height: Option<(i64, u128)> = None;
+                let started_at = std::time::Instant::now();
+                let mut events = Vec::new();
+                let mut writes = Vec::new();
+                let args = [CommandArg::Number(1)];
+                let mut last_height: Option<(i64, u128)> = None;
 
-            for tick in 1..=ticks {
-                let tick_started_at = std::time::Instant::now();
-                session.write_command(motion_name, &args).await?;
-                writes.push(json!({
-                    "tick": tick,
-                    "atMs": started_at.elapsed().as_millis(),
-                }));
+                for tick in 1..=ticks {
+                    let tick_started_at = std::time::Instant::now();
+                    session.write_command(motion_name, &args).await?;
+                    writes.push(json!({
+                        "tick": tick,
+                        "atMs": started_at.elapsed().as_millis(),
+                    }));
+                    let notifications = session
+                        .drain_available_notifications_timed(started_at)
+                        .await;
+                    collect_motion_events(
+                        &mut events,
+                        notifications,
+                        started_at,
+                        &mut last_height,
+                        Some(tick),
+                    );
+                    let cadence = Duration::from_millis(interval_ms);
+                    let elapsed = tick_started_at.elapsed();
+                    if elapsed < cadence {
+                        tokio::time::sleep(cadence - elapsed).await;
+                    }
+                }
+
                 let notifications = session
-                    .drain_available_notifications_timed(started_at)
+                    .drain_notifications_timed(Duration::from_millis(drain_ms), started_at)
                     .await;
                 collect_motion_events(
                     &mut events,
                     notifications,
                     started_at,
                     &mut last_height,
-                    Some(tick),
+                    None,
                 );
-                let cadence = Duration::from_millis(interval_ms);
-                let elapsed = tick_started_at.elapsed();
-                if elapsed < cadence {
-                    tokio::time::sleep(cadence - elapsed).await;
-                }
+                let after = session
+                    .send_command("get-height", &[], response_window)
+                    .await?;
+                let after_height = parsed_height(&after);
+                let analysis = motion_analysis(before_height, after_height, &writes, &events);
+                Ok::<_, anyhow::Error>(json!({
+                    "deviceName": session.device_name(),
+                    "action": "watch-motion",
+                    "direction": motion_name,
+                    "ticks": ticks,
+                    "intervalMs": interval_ms,
+                    "drainMs": drain_ms,
+                    "beforeHeight": before_height,
+                    "afterHeight": after_height,
+                    "observedDelta": match (before_height, after_height) {
+                        (Some(start), Some(end)) => Some(end - start),
+                        _ => None,
+                    },
+                    "writes": writes,
+                    "events": events,
+                    "analysis": analysis,
+                }))
             }
-
-            let notifications = session
-                .drain_notifications_timed(Duration::from_millis(drain_ms), started_at)
-                .await;
-            collect_motion_events(
-                &mut events,
-                notifications,
-                started_at,
-                &mut last_height,
-                None,
-            );
-            let after = session
-                .send_command("get-height", &[], response_window)
-                .await?;
-            let after_height = parsed_height(&after);
-            let analysis = motion_analysis(before_height, after_height, &writes, &events);
+            .await;
             session.disconnect().await;
-
-            print_json(json!({
-                "deviceName": session.device_name(),
-                "action": "watch-motion",
-                "direction": motion_name,
-                "ticks": ticks,
-                "intervalMs": interval_ms,
-                "drainMs": drain_ms,
-                "beforeHeight": before_height,
-                "afterHeight": after_height,
-                "observedDelta": match (before_height, after_height) {
-                    (Some(start), Some(end)) => Some(end - start),
-                    _ => None,
-                },
-                "writes": writes,
-                "events": events,
-                "analysis": analysis,
-            }))?;
+            print_json(result?)?;
         }
         Command::BenchHeightPoll {
             device_name,
@@ -701,71 +751,81 @@ async fn main() -> anyhow::Result<()> {
             ))
             .await?;
 
-            let connected_at = std::time::Instant::now();
-            let mut runs = Vec::new();
-            for interval_ms in intervals {
-                let requested_interval = Duration::from_millis(interval_ms);
-                session
-                    .drain_notifications(Duration::from_millis(100))
-                    .await;
+            let result = async {
+                let connected_at = std::time::Instant::now();
+                let mut runs = Vec::new();
+                for interval_ms in intervals {
+                    let requested_interval = Duration::from_millis(interval_ms);
+                    session
+                        .drain_notifications(Duration::from_millis(100))
+                        .await;
 
-                let run_started_at = std::time::Instant::now();
-                let mut sample_results = Vec::new();
-                let mut response_latencies = Vec::new();
-                let mut period_ms = Vec::new();
-                let mut previous_start_ms: Option<u128> = None;
+                    let run_started_at = std::time::Instant::now();
+                    let mut sample_results = Vec::new();
+                    let mut response_latencies = Vec::new();
+                    let mut period_ms = Vec::new();
+                    let mut previous_start_ms: Option<u128> = None;
 
-                for sample in 1..=samples {
-                    let sample_started_at = std::time::Instant::now();
-                    let sample_start_ms = run_started_at.elapsed().as_millis();
-                    if let Some(previous_start_ms) = previous_start_ms {
-                        period_ms.push(sample_start_ms.saturating_sub(previous_start_ms));
+                    for sample in 1..=samples {
+                        let sample_started_at = std::time::Instant::now();
+                        let sample_start_ms = run_started_at.elapsed().as_millis();
+                        if let Some(previous_start_ms) = previous_start_ms {
+                            period_ms.push(sample_start_ms.saturating_sub(previous_start_ms));
+                        }
+                        previous_start_ms = Some(sample_start_ms);
+
+                        let result = session
+                            .send_command_with_quiet(
+                                "get-height",
+                                &[],
+                                response_window,
+                                response_quiet,
+                            )
+                            .await?;
+                        let response_latency_ms = sample_started_at.elapsed().as_millis();
+                        let height = parsed_height(&result);
+                        if height.is_some() {
+                            response_latencies.push(response_latency_ms);
+                        }
+                        sample_results.push(json!({
+                            "sample": sample,
+                            "startedAtMs": sample_start_ms,
+                            "responseLatencyMs": response_latency_ms,
+                            "height": height,
+                            "matched": !result.matched_notifications.is_empty(),
+                            "matchKind": result.match_kind.clone(),
+                            "notificationCount": result.notifications.len(),
+                        }));
+
+                        let elapsed = sample_started_at.elapsed();
+                        if sample < samples && elapsed < requested_interval {
+                            tokio::time::sleep(requested_interval - elapsed).await;
+                        }
                     }
-                    previous_start_ms = Some(sample_start_ms);
 
-                    let result = session
-                        .send_command_with_quiet("get-height", &[], response_window, response_quiet)
-                        .await?;
-                    let response_latency_ms = sample_started_at.elapsed().as_millis();
-                    let height = parsed_height(&result);
-                    if height.is_some() {
-                        response_latencies.push(response_latency_ms);
-                    }
-                    sample_results.push(json!({
-                        "sample": sample,
-                        "startedAtMs": sample_start_ms,
-                        "responseLatencyMs": response_latency_ms,
-                        "height": height,
-                        "matched": !result.matched_notifications.is_empty(),
-                        "notificationCount": result.notifications.len(),
+                    runs.push(json!({
+                        "requestedIntervalMs": interval_ms,
+                        "samples": samples,
+                        "elapsedMs": run_started_at.elapsed().as_millis(),
+                        "heightResponses": response_latencies.len(),
+                        "responseLatencyMs": latency_summary(&response_latencies),
+                        "observedPeriodMs": latency_summary(&period_ms),
+                        "sampleResults": sample_results,
                     }));
-
-                    let elapsed = sample_started_at.elapsed();
-                    if sample < samples && elapsed < requested_interval {
-                        tokio::time::sleep(requested_interval - elapsed).await;
-                    }
                 }
 
-                runs.push(json!({
-                    "requestedIntervalMs": interval_ms,
-                    "samples": samples,
-                    "elapsedMs": run_started_at.elapsed().as_millis(),
-                    "heightResponses": response_latencies.len(),
-                    "responseLatencyMs": latency_summary(&response_latencies),
-                    "observedPeriodMs": latency_summary(&period_ms),
-                    "sampleResults": sample_results,
-                }));
+                Ok::<_, anyhow::Error>(json!({
+                    "deviceName": session.device_name(),
+                    "action": "bench-height-poll",
+                    "connectedElapsedMs": connected_at.elapsed().as_millis(),
+                    "responseWaitMs": response_wait_ms,
+                    "responseQuietMs": response_quiet_ms,
+                    "runs": runs,
+                }))
             }
+            .await;
             session.disconnect().await;
-
-            print_json(json!({
-                "deviceName": session.device_name(),
-                "action": "bench-height-poll",
-                "connectedElapsedMs": connected_at.elapsed().as_millis(),
-                "responseWaitMs": response_wait_ms,
-                "responseQuietMs": response_quiet_ms,
-                "runs": runs,
-            }))?;
+            print_json(result?)?;
         }
         Command::ProfileMotion {
             direction,
@@ -803,6 +863,52 @@ enum HeightTarget {
     RelativeCm(f64),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HeightBounds {
+    min: i64,
+    max: i64,
+}
+
+impl HeightBounds {
+    fn from_cm(min_height_cm: f64, max_height_cm: f64) -> anyhow::Result<Self> {
+        if !min_height_cm.is_finite()
+            || !max_height_cm.is_finite()
+            || min_height_cm <= 0.0
+            || max_height_cm <= 0.0
+        {
+            anyhow::bail!("height bounds must be positive centimetre values");
+        }
+
+        let min = (min_height_cm * 10.0).round() as i64;
+        let max = (max_height_cm * 10.0).round() as i64;
+        if min >= max {
+            anyhow::bail!("minimum height must be lower than maximum height");
+        }
+
+        Ok(Self { min, max })
+    }
+
+    fn validate_target(self, target_height: i64) -> anyhow::Result<()> {
+        if target_height < self.min || target_height > self.max {
+            anyhow::bail!(
+                "target height {:.1}cm is outside configured bounds {:.1}cm..={:.1}cm",
+                height_units_to_cm(target_height),
+                self.min_cm(),
+                self.max_cm()
+            );
+        }
+        Ok(())
+    }
+
+    fn min_cm(self) -> f64 {
+        height_units_to_cm(self.min)
+    }
+
+    fn max_cm(self) -> f64 {
+        height_units_to_cm(self.max)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_motion_profile(
     action: &str,
@@ -830,79 +936,83 @@ async fn run_motion_profile(
         true,
     ))
     .await?;
-    let before = session
-        .send_command("get-height", &[], response_window)
-        .await?;
-    let before_height = parsed_height(&before);
-    session.drain_notifications(Duration::from_millis(50)).await;
+    let result = (async {
+        let before = session
+            .send_command("get-height", &[], response_window)
+            .await?;
+        let before_height = parsed_height(&before);
+        session.drain_notifications(Duration::from_millis(50)).await;
 
-    let started_at = std::time::Instant::now();
-    let mut events = Vec::new();
-    let mut writes = Vec::new();
-    let args = [CommandArg::Number(1)];
-    let mut last_height: Option<(i64, u128)> = None;
+        let started_at = std::time::Instant::now();
+        let mut events = Vec::new();
+        let mut writes = Vec::new();
+        let args = [CommandArg::Number(1)];
+        let mut last_height: Option<(i64, u128)> = None;
 
-    for tick in 1..=ticks {
-        let tick_started_at = std::time::Instant::now();
-        session.write_command(motion_name, &args).await?;
-        writes.push(json!({
-            "tick": tick,
-            "atMs": started_at.elapsed().as_millis(),
-        }));
+        for tick in 1..=ticks {
+            let tick_started_at = std::time::Instant::now();
+            session.write_command(motion_name, &args).await?;
+            writes.push(json!({
+                "tick": tick,
+                "atMs": started_at.elapsed().as_millis(),
+            }));
+            let notifications = session
+                .drain_available_notifications_timed(started_at)
+                .await;
+            collect_motion_events(
+                &mut events,
+                notifications,
+                started_at,
+                &mut last_height,
+                Some(tick),
+            );
+            let cadence = Duration::from_millis(interval_ms);
+            let elapsed = tick_started_at.elapsed();
+            if elapsed < cadence {
+                tokio::time::sleep(cadence - elapsed).await;
+            }
+        }
+
         let notifications = session
-            .drain_available_notifications_timed(started_at)
+            .drain_notifications_timed(Duration::from_millis(drain_ms), started_at)
             .await;
         collect_motion_events(
             &mut events,
             notifications,
             started_at,
             &mut last_height,
-            Some(tick),
+            None,
         );
-        let cadence = Duration::from_millis(interval_ms);
-        let elapsed = tick_started_at.elapsed();
-        if elapsed < cadence {
-            tokio::time::sleep(cadence - elapsed).await;
-        }
-    }
+        let after = session
+            .send_command("get-height", &[], response_window)
+            .await?;
+        let after_height = parsed_height(&after);
+        let analysis = motion_analysis(before_height, after_height, &writes, &events);
+        let profile = motion_profile_summary(before_height, after_height, &writes, &events);
+        let device_name = session.device_name().to_string();
 
-    let notifications = session
-        .drain_notifications_timed(Duration::from_millis(drain_ms), started_at)
-        .await;
-    collect_motion_events(
-        &mut events,
-        notifications,
-        started_at,
-        &mut last_height,
-        None,
-    );
-    let after = session
-        .send_command("get-height", &[], response_window)
-        .await?;
-    let after_height = parsed_height(&after);
-    let analysis = motion_analysis(before_height, after_height, &writes, &events);
-    let profile = motion_profile_summary(before_height, after_height, &writes, &events);
-    let device_name = session.device_name().to_string();
+        Ok::<_, anyhow::Error>(json!({
+            "deviceName": device_name,
+            "action": action,
+            "direction": motion_name,
+            "ticks": ticks,
+            "intervalMs": interval_ms,
+            "drainMs": drain_ms,
+            "beforeHeight": before_height,
+            "afterHeight": after_height,
+            "observedDelta": match (before_height, after_height) {
+                (Some(start), Some(end)) => Some(end - start),
+                _ => None,
+            },
+            "writes": writes,
+            "events": events,
+            "analysis": analysis,
+            "profile": profile,
+        }))
+    })
+    .await;
     session.disconnect().await;
-
-    Ok(json!({
-        "deviceName": device_name,
-        "action": action,
-        "direction": motion_name,
-        "ticks": ticks,
-        "intervalMs": interval_ms,
-        "drainMs": drain_ms,
-        "beforeHeight": before_height,
-        "afterHeight": after_height,
-        "observedDelta": match (before_height, after_height) {
-            (Some(start), Some(end)) => Some(end - start),
-            _ => None,
-        },
-        "writes": writes,
-        "events": events,
-        "analysis": analysis,
-        "profile": profile,
-    }))
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -914,6 +1024,8 @@ async fn run_height_move(
     timeout_ms: u64,
     scan_timeout_ms: u64,
     connect_timeout_ms: u64,
+    min_height_cm: f64,
+    max_height_cm: f64,
 ) -> anyhow::Result<()> {
     let tolerance = SET_HEIGHT_TOLERANCE;
     let interval_ms = SET_HEIGHT_INTERVAL_MS;
@@ -923,6 +1035,7 @@ async fn run_height_move(
     let fine_settle_ms = SET_HEIGHT_FINE_SETTLE_MS;
     let burst_settle_ms = SET_HEIGHT_BURST_SETTLE_MS;
     let response_window_ms = SET_HEIGHT_RESPONSE_WINDOW_MS;
+    let bounds = HeightBounds::from_cm(min_height_cm, max_height_cm)?;
     let characteristic = resolve_characteristic(&characteristic)?.to_string();
     let response_window = Duration::from_millis(response_window_ms);
     let mut session = DeskSession::connect(query_options(
@@ -937,130 +1050,139 @@ async fn run_height_move(
     ))
     .await?;
 
-    let started_at = std::time::Instant::now();
-    let mut samples = Vec::new();
-    let initial_drained = session.drain_available_notifications().await;
-    let initial_drained_heights: Vec<_> = initial_drained
-        .iter()
-        .filter_map(notification_height)
-        .collect();
-    let mut current = read_height(&mut session, response_window).await?;
-    let starting_height = current;
-    let (target_height, requested_delta_cm) = match height_target {
-        HeightTarget::AbsoluteCm(target_height_cm) => {
-            (height_units_from_cm(target_height_cm)?, None)
-        }
-        HeightTarget::RelativeCm(delta_cm) => {
-            let delta_height = height_delta_units_from_cm(delta_cm)?;
-            let target_height = current + delta_height;
-            if target_height <= 0 {
-                anyhow::bail!("target height must be positive");
+    let result = (async {
+        let started_at = std::time::Instant::now();
+        let mut samples = Vec::new();
+        let initial_drained = session.drain_available_notifications().await;
+        let initial_drained_heights: Vec<_> = initial_drained
+            .iter()
+            .filter_map(notification_height)
+            .collect();
+        let mut current = read_height(&mut session, response_window).await?;
+        let starting_height = current;
+        let (target_height, requested_delta_cm) = match height_target {
+            HeightTarget::AbsoluteCm(target_height_cm) => {
+                (height_units_from_cm(target_height_cm)?, None)
             }
-            (target_height, Some(delta_cm))
-        }
-    };
-    samples.push(json!({
-        "label": "start",
-        "height": current,
-        "heightCm": height_units_to_cm(current),
-        "drainedHeights": initial_drained_heights,
-        "deltaToTarget": target_height - current,
-    }));
-
-    let mut correction_count = 0_u32;
-    while (target_height - current).abs() > tolerance {
-        if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
-            anyhow::bail!("timed out moving to target: current={current} target={target_height}");
-        }
-
-        let previous_height = current;
-        let delta = target_height - current;
-        let direction = if delta > 0 { "drive-up" } else { "drive-down" };
-        let remaining = delta.abs();
-        let fine_mode = remaining <= fine_threshold || correction_count > 0;
-        let planned_ticks = if correction_count > 0 {
-            1
-        } else if fine_mode {
-            ((remaining.saturating_sub(tolerance).max(1) as f64) / fine_units_per_tick)
-                .ceil()
-                .max(1.0) as u32
-        } else {
-            ((remaining as f64) / units_per_tick).round().max(1.0) as u32
+            HeightTarget::RelativeCm(delta_cm) => {
+                let delta_height = height_delta_units_from_cm(delta_cm)?;
+                let target_height = current + delta_height;
+                if target_height <= 0 {
+                    anyhow::bail!("target height must be positive");
+                }
+                (target_height, Some(delta_cm))
+            }
         };
-        let planned_ticks = planned_ticks.max(1);
-        let wrote = write_motion_ticks(
-            &mut session,
-            direction,
-            planned_ticks,
-            Duration::from_millis(interval_ms),
-        )
-        .await?;
-        let settle_ms = if fine_mode {
-            fine_settle_ms
-        } else {
-            burst_settle_ms
-        };
-        tokio::time::sleep(Duration::from_millis(settle_ms)).await;
-        let drained = session.drain_available_notifications().await;
-        let drained_heights: Vec<_> = drained.iter().filter_map(notification_height).collect();
-        current = read_height(&mut session, response_window).await?;
-        let observed_delta = current - previous_height;
-        let overshot = (target_height - current).signum()
-            != (target_height - previous_height).signum()
-            && (target_height - current).abs() > tolerance;
-        if overshot {
-            correction_count += 1;
-        }
-
+        bounds.validate_target(target_height)?;
         samples.push(json!({
-            "label": format!("step-{}", samples.len()),
-            "direction": direction,
-            "fineMode": fine_mode,
-            "ticks": planned_ticks,
-            "wrote": wrote,
-            "drainedHeights": drained_heights,
-            "settleMs": settle_ms,
+            "label": "start",
             "height": current,
             "heightCm": height_units_to_cm(current),
+            "drainedHeights": initial_drained_heights,
             "deltaToTarget": target_height - current,
-            "observedDelta": observed_delta,
-            "observedDeltaCm": height_units_to_cm(observed_delta),
-            "observedUnitsPerTick": observed_delta as f64 / planned_ticks as f64,
-            "correctionCount": correction_count,
-            "elapsedMs": started_at.elapsed().as_millis(),
         }));
 
-        if correction_count >= 4 {
-            anyhow::bail!(
-                "stopped after repeated overshoot corrections: current={current} target={target_height}"
-            );
-        }
-    }
+        let mut correction_count = 0_u32;
+        while (target_height - current).abs() > tolerance {
+            if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
+                anyhow::bail!(
+                    "timed out moving to target: current={current} target={target_height}"
+                );
+            }
 
+            let previous_height = current;
+            let delta = target_height - current;
+            let direction = if delta > 0 { "drive-up" } else { "drive-down" };
+            let remaining = delta.abs();
+            let fine_mode = remaining <= fine_threshold || correction_count > 0;
+            let planned_ticks = if correction_count > 0 {
+                1
+            } else if fine_mode {
+                ((remaining.saturating_sub(tolerance).max(1) as f64) / fine_units_per_tick)
+                    .ceil()
+                    .max(1.0) as u32
+            } else {
+                ((remaining as f64) / units_per_tick).round().max(1.0) as u32
+            };
+            let planned_ticks = planned_ticks.max(1);
+            let wrote = write_motion_ticks(
+                &mut session,
+                direction,
+                planned_ticks,
+                Duration::from_millis(interval_ms),
+            )
+            .await?;
+            let settle_ms = if fine_mode {
+                fine_settle_ms
+            } else {
+                burst_settle_ms
+            };
+            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+            let drained = session.drain_available_notifications().await;
+            let drained_heights: Vec<_> = drained.iter().filter_map(notification_height).collect();
+            current = read_height(&mut session, response_window).await?;
+            let observed_delta = current - previous_height;
+            let overshot = (target_height - current).signum()
+                != (target_height - previous_height).signum()
+                && (target_height - current).abs() > tolerance;
+            if overshot {
+                correction_count += 1;
+            }
+
+            samples.push(json!({
+                "label": format!("step-{}", samples.len()),
+                "direction": direction,
+                "fineMode": fine_mode,
+                "ticks": planned_ticks,
+                "wrote": wrote,
+                "drainedHeights": drained_heights,
+                "settleMs": settle_ms,
+                "height": current,
+                "heightCm": height_units_to_cm(current),
+                "deltaToTarget": target_height - current,
+                "observedDelta": observed_delta,
+                "observedDeltaCm": height_units_to_cm(observed_delta),
+                "observedUnitsPerTick": observed_delta as f64 / planned_ticks as f64,
+                "correctionCount": correction_count,
+                "elapsedMs": started_at.elapsed().as_millis(),
+            }));
+
+            if correction_count >= 4 {
+                anyhow::bail!(
+                    "stopped after repeated overshoot corrections: current={current} target={target_height}"
+                );
+            }
+        }
+
+        Ok::<_, anyhow::Error>(json!({
+            "deviceName": session.device_name(),
+            "action": action,
+            "targetHeight": target_height,
+            "targetHeightCm": height_units_to_cm(target_height),
+            "requestedDeltaCm": requested_delta_cm,
+            "minHeightCm": bounds.min_cm(),
+            "maxHeightCm": bounds.max_cm(),
+            "tolerance": tolerance,
+            "startingHeight": starting_height,
+            "startingHeightCm": height_units_to_cm(starting_height),
+            "finalHeight": current,
+            "finalHeightCm": height_units_to_cm(current),
+            "observedDelta": current - starting_height,
+            "observedDeltaCm": height_units_to_cm(current - starting_height),
+            "withinTolerance": (target_height - current).abs() <= tolerance,
+            "elapsedMs": started_at.elapsed().as_millis(),
+            "intervalMs": interval_ms,
+            "unitsPerTick": units_per_tick,
+            "fineUnitsPerTick": fine_units_per_tick,
+            "fineThreshold": fine_threshold,
+            "fineSettleMs": fine_settle_ms,
+            "burstSettleMs": burst_settle_ms,
+            "samples": samples,
+        }))
+    })
+    .await;
     session.disconnect().await;
-    print_json(json!({
-        "deviceName": session.device_name(),
-        "action": action,
-        "targetHeight": target_height,
-        "targetHeightCm": height_units_to_cm(target_height),
-        "requestedDeltaCm": requested_delta_cm,
-        "tolerance": tolerance,
-        "startingHeight": starting_height,
-        "startingHeightCm": height_units_to_cm(starting_height),
-        "finalHeight": current,
-        "finalHeightCm": height_units_to_cm(current),
-        "observedDelta": current - starting_height,
-        "observedDeltaCm": height_units_to_cm(current - starting_height),
-        "withinTolerance": (target_height - current).abs() <= tolerance,
-        "elapsedMs": started_at.elapsed().as_millis(),
-        "intervalMs": interval_ms,
-        "unitsPerTick": units_per_tick,
-        "fineUnitsPerTick": fine_units_per_tick,
-        "fineThreshold": fine_threshold,
-        "fineSettleMs": fine_settle_ms,
-        "burstSettleMs": burst_settle_ms,
-        "samples": samples,
-    }))?;
+    print_json(result?)?;
     Ok(())
 }
 
@@ -1110,14 +1232,12 @@ fn query_options(
     }
 }
 
-fn parsed_height(result: &impl serde::Serialize) -> Option<i64> {
-    serde_json::to_value(result)
-        .ok()?
-        .get("matchedNotifications")?
-        .get(0)?
-        .get("parsed")?
-        .get("height")?
-        .as_i64()
+fn parsed_height(result: &QueryResult) -> Option<i64> {
+    result
+        .matched_notifications
+        .iter()
+        .rev()
+        .find_map(notification_height)
 }
 
 fn notification_height(value: &serde_json::Value) -> Option<i64> {
@@ -1474,6 +1594,18 @@ mod tests {
     }
 
     #[test]
+    fn height_bounds_validate_target_range() {
+        let bounds = HeightBounds::from_cm(60.0, 130.0).unwrap();
+
+        assert!(bounds.validate_target(600).is_ok());
+        assert!(bounds.validate_target(1000).is_ok());
+        assert!(bounds.validate_target(1300).is_ok());
+        assert!(bounds.validate_target(599).is_err());
+        assert!(bounds.validate_target(1301).is_err());
+        assert!(HeightBounds::from_cm(130.0, 60.0).is_err());
+    }
+
+    #[test]
     fn adjust_height_accepts_negative_delta() {
         let cli = Cli::try_parse_from([
             "desk",
@@ -1487,6 +1619,30 @@ mod tests {
             panic!("expected adjust-height command");
         };
         assert_eq!(delta_cm, -5.0);
+    }
+
+    #[test]
+    fn set_height_accepts_custom_height_bounds() {
+        let cli = Cli::try_parse_from([
+            "desk",
+            "set-height",
+            "100",
+            "--min-height-cm",
+            "61.5",
+            "--max-height-cm",
+            "127.5",
+        ])
+        .unwrap();
+        let Command::SetHeight {
+            min_height_cm,
+            max_height_cm,
+            ..
+        } = cli.command
+        else {
+            panic!("expected set-height command");
+        };
+        assert_eq!(min_height_cm, 61.5);
+        assert_eq!(max_height_cm, 127.5);
     }
 
     #[test]

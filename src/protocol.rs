@@ -20,8 +20,15 @@ pub enum ProtocolError {
     InvalidNonce,
     #[error("packet too short")]
     PacketTooShort,
+    #[error("decrypted packet too short: {len} bytes")]
+    DecryptedPacketTooShort { len: usize },
     #[error("encrypted length mismatch: header={header} actual={actual}")]
     EncryptedLengthMismatch { header: usize, actual: usize },
+    #[error("payload length exceeds decrypted packet: payload={payload_len} plain={plain_len}")]
+    PayloadLengthMismatch {
+        payload_len: usize,
+        plain_len: usize,
+    },
     #[error("CRC mismatch: header=0x{header:04x} actual=0x{actual:04x}")]
     CrcMismatch { header: u16, actual: u16 },
 }
@@ -30,6 +37,7 @@ pub enum ProtocolError {
 pub struct Packet {
     pub command: u8,
     pub status: u8,
+    pub nonce: [u8; 2],
     #[serde(serialize_with = "crate::response::as_hex")]
     pub payload: Vec<u8>,
     #[serde(serialize_with = "crate::response::as_hex")]
@@ -46,6 +54,7 @@ pub struct DecodeFrame {
     #[serde(rename = "commandName")]
     pub command_name: String,
     pub status: u8,
+    pub nonce: String,
     #[serde(serialize_with = "crate::response::as_hex")]
     pub payload: Vec<u8>,
     pub parsed: serde_json::Value,
@@ -119,10 +128,22 @@ pub fn decode_packet(raw_packet: &[u8]) -> Result<Packet, ProtocolError> {
     }
 
     let plain = xxtea_decrypt(encrypted);
+    if plain.len() < 4 {
+        return Err(ProtocolError::DecryptedPacketTooShort { len: plain.len() });
+    }
+    let required_plain_len = 4 + payload_len;
+    if plain.len() < required_plain_len {
+        return Err(ProtocolError::PayloadLengthMismatch {
+            payload_len,
+            plain_len: plain.len(),
+        });
+    }
+
     Ok(Packet {
         command: plain[0],
         status: plain[1],
-        payload: plain[4..4 + payload_len].to_vec(),
+        nonce: [plain[2], plain[3]],
+        payload: plain[4..required_plain_len].to_vec(),
         plain,
     })
 }
@@ -197,6 +218,7 @@ pub fn decode_slip_stream(bytes: &[u8]) -> Result<DecodeStream, ProtocolError> {
             command_hex: format!("0x{:02x}", packet.command),
             command_name: command_name(packet.command).to_string(),
             status: packet.status,
+            nonce: hex::encode(packet.nonce),
             payload: packet.payload.clone(),
             parsed: parse_response(packet.command, &packet.payload),
             plain: packet.plain,
@@ -326,5 +348,37 @@ pub fn command_name(command: u8) -> &'static str {
         0x2b => "connection-interface",
         0x30 => "handset-protocol",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_packet_exposes_nonce() {
+        let packet = encode_packet(0x08, &[0x00, 0x00, 0x00], Some([0x12, 0x34]));
+
+        let decoded = decode_packet(&packet).unwrap();
+
+        assert_eq!(decoded.command, 0x08);
+        assert_eq!(decoded.nonce, [0x12, 0x34]);
+        assert_eq!(decoded.payload, [0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn decode_packet_rejects_payload_length_beyond_decrypted_plaintext() {
+        let mut packet = encode_packet(0x08, &[0x00, 0x00, 0x00], Some([0x12, 0x34]));
+        packet[1] = 250;
+
+        let error = decode_packet(&packet).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProtocolError::PayloadLengthMismatch {
+                payload_len: 250,
+                ..
+            }
+        ));
     }
 }
