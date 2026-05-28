@@ -96,6 +96,8 @@ jobs:
             fi
           done
 
+          find prebuilt -type f ! -name '*.exe' -exec chmod 755 {} \;
+
       - name: Check npm version
         shell: bash
         run: |

@@ -28,4 +28,22 @@ if (packagedBinaries.length === 0) {
   process.exit(1);
 }
 
+const nonExecutableBinaries = packagedBinaries.filter((binaryPath) => {
+  if (binaryPath.endsWith(".exe")) {
+    return false;
+  }
+
+  return (statSync(binaryPath).mode & 0o111) === 0;
+});
+
+if (nonExecutableBinaries.length > 0) {
+  console.error(
+    [
+      "Prebuilt Unix binaries must be executable:",
+      ...nonExecutableBinaries.map((binaryPath) => `- ${binaryPath}`),
+    ].join("\n"),
+  );
+  process.exit(1);
+}
+
 console.log(`Found ${packagedBinaries.length} prebuilt binary package entry.`);
