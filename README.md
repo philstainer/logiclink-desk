@@ -121,6 +121,9 @@ npm run prepare:binary
 npm pack
 ```
 
+The GitHub Actions workflow publishes to npm whenever changes are pushed to `main`.
+Add an npm automation token as the repository secret `NPM_TOKEN` before relying on the workflow.
+
 Available npm scripts:
 
 ```sh
