@@ -72,7 +72,6 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: 20
-          registry-url: https://registry.npmjs.org
 
       - name: Download staged binaries
         uses: actions/download-artifact@v7
@@ -113,6 +112,7 @@ jobs:
         run: npm pack --dry-run
 
       - name: Publish package
+        shell: bash
         run: npm publish
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: true
