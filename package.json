@@ -1,6 +1,6 @@
 {
   "name": "logiclink-desk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CLI tooling for LOGIClink Bluetooth standing desks.",
   "bin": {
     "logiclink-desk": "npm/bin/logiclink-desk.js"
@@ -23,7 +23,7 @@
     "logiclink",
     "cli"
   ],
-  "license": "UNLICENSED",
+  "license": "MIT",
   "engines": {
     "node": ">=18"
   }
